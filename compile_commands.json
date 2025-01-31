@@ -1,0 +1,18 @@
+[
+  {
+    "arguments": [
+      "/usr/bin/g++",
+      "-std=c++17",
+      "-pg",
+      "-Wall",
+      "-Iinclude/",
+      "-c",
+      "-o",
+      "bin/fluids.o",
+      "src/fluids.cpp"
+    ],
+    "directory": "/home/andrewbelles/Projects/fluidsimulation",
+    "file": "/home/andrewbelles/Projects/fluidsimulation/src/fluids.cpp",
+    "output": "/home/andrewbelles/Projects/fluidsimulation/bin/fluids.o"
+  }
+]
