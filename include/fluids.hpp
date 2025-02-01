@@ -45,8 +45,8 @@ public:
       "Particle Simulation",
       SDL_WINDOWPOS_UNDEFINED,
       SDL_WINDOWPOS_UNDEFINED,
-      1280,
-      720,
+      1920,
+      1080,
       SDL_WINDOW_OPENGL
     );
 

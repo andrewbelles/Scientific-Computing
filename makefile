@@ -13,7 +13,7 @@ CU_SRC = $(wildcard src/cuda/*.cu)
 CXX_SRC = $(wildcard src/*.cpp)
 OBJ = $(C_SRC:src/%.c=bin/%.o) $(CXX_SRC:src/%.cpp=bin/%.o) $(CU_SRC:src/cuda/%.cu=bin/%.o)
 
-ARGS = 1000 10
+ARGS = 5000 25
 
 all: $(EXEC)
 
@@ -30,13 +30,16 @@ bin/%.o: src/cuda/%.cu
 	$(CCU) $(CUFLAGS) -c $< -o $@
 
 profile_cpu: $(EXEC)
+	@echo "Profiling CPU"
 	./$(EXEC) $(ARGS)
 	gprof $(EXEC) gmon.out > cpu_prof.txt
 
 profile_gpu: $(EXEC)
-	nsys profile --stats=true -o gpu_profile ./$(EXEC) $(ARGS) 
+	@echo "Profiling GPU"
+	sudo ncu --export gpu_prof.ncu-rep -f ./$(EXEC) $(ARGS) 
 
 clean:
+	@echo "Removing Files"
 	rm -f bin/*.o $(EXEC) gmon.out *.prof *.txt
 
 .PHONY: all clean profile_cpu profile_gpu

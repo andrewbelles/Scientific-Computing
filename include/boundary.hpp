@@ -14,9 +14,9 @@ struct Container {
   float upper[3];
 };
 
-__host__ void updateBounds(spatialLookupTable *d_lookup_, sphParticle *d_particles_, std::vector<float> new_container, uint32_t particle_recount, const float h);
+__host__ void updateBounds(spatialLookupTable *d_lookup_, particleContainer *d_particleContainer_, std::vector<float> new_container, uint32_t particle_recount, const float h);
 
-__host__ void callToBoundaryConditions(struct Container boundary, sphParticle *d_particles_, uint32_t n_particles, uint32_t n_partitions, const float h);
+__host__ void callToBoundaryConditions(struct Container boundary, particleContainer *d_particleContainer_, uint32_t n_particles, uint32_t n_partitions, const float h);
 
 
 #endif // __BOUNDARY_HPP__

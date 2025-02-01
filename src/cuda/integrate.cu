@@ -6,8 +6,8 @@
 // Defines 
 #define k 3000
 #define rho0 1000
-#define dt 1e-3
-#define viscosity 1
+#define dt 1e-3       // Change to dynamically shift in value 
+#define viscosity 1e-2
 
 // #define _debug
 //#define _verbose
@@ -47,10 +47,10 @@ __device__ static inline void sum(T arr1[3], const T arr2[3]) {
 /*
    Cubic Spline smooth field approximating kernel. 
    */
-__host__ __device__ float cubicSpline(float distance, float smoothingRadius) {
+__host__ __device__ float cubicSpline(float distance, float smooth_radius) {
   // Constant values
-  const float  q = distance / smoothingRadius;
-  const float  a3 = 1.0 / (M_PI * smoothingRadius * smoothingRadius * smoothingRadius);
+  const float  q = distance / smooth_radius;
+  const float  a3 = 1.0 / (M_PI * smooth_radius * smooth_radius * smooth_radius);
   float value = a3;
 
   // Calcuate value of kernel over the smoothing radius
@@ -68,9 +68,10 @@ __host__ __device__ float cubicSpline(float distance, float smoothingRadius) {
 /*
    The gradient of the Cubic Spline kernel 
    */
-__host__ __device__ float gradCubicSpline(float distance, float smoothingRadius) {
-  const float  q = distance / smoothingRadius;
-  const float  a3 = 1.0 / (M_PI * smoothingRadius * smoothingRadius * smoothingRadius);
+__host__ __device__ float gradCubicSpline(float distance, float smooth_radius) {
+  // Constant values
+  const float  q = distance / smooth_radius;
+  const float  a3 = 1.0 / (M_PI * smooth_radius * smooth_radius * smooth_radius);
   float value = a3;
 
   // Calculate the gradient of the kernel over the smoothing radius
@@ -88,9 +89,9 @@ __host__ __device__ float gradCubicSpline(float distance, float smoothingRadius)
 /*
    The laplacian of the Cubic Spline kernel 
    */
-__host__ __device__ float laplacianCubicSpline(float distance, float smoothingRadius) {
-  const float  q = distance / smoothingRadius;
-  const float  a3 = 1.0 / (M_PI * smoothingRadius * smoothingRadius * smoothingRadius);
+__host__ __device__ float laplacianCubicSpline(float distance, float smooth_radius) {
+  const float  q = distance / smooth_radius;
+  const float  a3 = 1.0 / (M_PI * smooth_radius * smooth_radius * smooth_radius);
   float value = a3;
 
   // Calculate the laplacian of the kernel over the smoothing radius
@@ -142,7 +143,7 @@ __device__ static void calculateViscosityForce(float velocity_difference[3], flo
    */
 __global__ static void neighborKernel(
   spatialLookupTable *d_lookup_,
-  sphParticle *d_particles_,
+  particleContainer *d_particleContainer_,
   uint32_t n_partitions, 
   uint32_t n_particles,
   uint32_t containerCount[3],
@@ -172,7 +173,12 @@ __global__ static void neighborKernel(
   }
 #endif
   // Create cell coordinate at pid's position
-  positionToCellCoord(cell_coord, d_particles_[pid].position, h);
+  float local_pos[3] = {
+    d_particleContainer_->positions[pid],
+    d_particleContainer_->positions[pid + n_particles],
+    d_particleContainer_->positions[pid + 2 * n_particles],
+  };    // Declared here to leverage static initialization
+  positionToCellCoord(cell_coord, local_pos, h);
 
   // Iterate around the cell coordinate
   for (int dz = -1; dz <= 1; ++dz) {
@@ -235,41 +241,78 @@ __global__ static void neighborKernel(
           if (rel >= n_particles) printf("wtf\n"); // shouldn't be an issue anymore -> so far hasn't been 
           if (rel == pid) continue; 
 
+          float local_vel[3] = {
+            d_particleContainer_->positions[pid],
+            d_particleContainer_->positions[pid + n_particles],
+            d_particleContainer_->positions[pid + 2 * n_particles],
+          };
+
+          float rel_pos[3] = {
+            d_particleContainer_->positions[rel],
+            d_particleContainer_->positions[rel + n_particles],
+            d_particleContainer_->positions[rel + 2 * n_particles],
+          };
+
+          float rel_vel[3] = {
+            d_particleContainer_->velocities[rel],
+            d_particleContainer_->velocities[rel + n_particles],
+            d_particleContainer_->velocities[rel + 2 * n_particles],
+          };
+
           // Copies position to displacement and finds the vector displacement between src and rel 
-          assign(displacement, d_particles_[pid].position);
-          relativeDisplacement(displacement, d_particles_[rel].position);
+          assign(displacement, local_pos);
+          relativeDisplacement(displacement, rel_pos);
 #ifdef _debug
           for (int i = 0; i < 3; ++i)
             if (displacement[i] > 10.0) printf("Error on idx %u for pid %u of displacement [%d]: %f\n", idx, pid, i, displacement[i]);
 #endif
-          distance = magnitude(displacement);       
+          distance = magnitude(displacement);    
 #ifdef _debug 
           if (distance > 10.0) printf("Error on idx %u for pid %u!\n", idx, pid);
           printf("idx: %u, distance: %f\n", idx, distance);
 #endif
           // Not neighbors -> continue 
-          if (distance > (2.0 * h)) continue;  
+          if (distance > (2.0 * h)) continue;
+
+          float pid_prfs[3] = {
+            d_particleContainer_->pressure_forces[pid],
+            d_particleContainer_->pressure_forces[pid + n_particles],
+            d_particleContainer_->pressure_forces[pid + 2 * n_particles],
+          };
+
+          float pid_visf[3] = {
+            d_particleContainer_->viscosity_forces[pid],
+            d_particleContainer_->viscosity_forces[pid + n_particles],
+            d_particleContainer_->viscosity_forces[pid + 2 * n_particles],
+          };
+
 #ifdef _debug
           printf("valid neighbor pair (pid, rel) -> (%u, %u)\n", pid, rel);
           printf("Neighbor Pair: (%u,%u)\n", pid, rel);
 #endif
           // Find the vector difference of velocity
-          assign(velocity_difference, d_particles_[pid].velocity);
-          relativeDisplacement(velocity_difference, d_particles_[rel].velocity);
+          assign(velocity_difference, local_vel);
+          relativeDisplacement(velocity_difference, rel_vel);
 
           // Find the density and set the new pressure
-          d_particles_[pid].density += d_particles_[rel].mass * cubicSpline(distance, h);
-          d_particles_[pid].pressure = static_cast<float>(k * (d_particles_[pid].density - rho0));
+
+          d_particleContainer_->densities[pid] += d_particleContainer_->masses[rel] * cubicSpline(distance, h);
+          d_particleContainer_->pressures[pid] = static_cast<float>(k * (d_particleContainer_->densities[pid] - rho0));
 
           // Calculate the approximate pressure force
           kernel_val = gradCubicSpline(distance, h);
-          calculatePressureForce(displacement, d_particles_[rel].mass, d_particles_[pid].density, d_particles_[rel].density, kernel_val);
-          sum(d_particles_[pid].pressure_force, displacement);
+          calculatePressureForce(displacement, d_particleContainer_->masses[rel], d_particleContainer_->densities[pid], d_particleContainer_->densities[rel], kernel_val);
+          sum(pid_prfs, displacement);
 
           // Calculate the approximate viscosity force 
           kernel_val = laplacianCubicSpline(distance, h);
-          calculateViscosityForce(velocity_difference, d_particles_[rel].mass, kernel_val);
-          sum(d_particles_[pid].viscosity_force, velocity_difference);
+          calculateViscosityForce(velocity_difference, d_particleContainer_->masses[rel], kernel_val);
+          sum(pid_visf, velocity_difference);
+
+          for (int i = 0; i < 3; ++i) {
+            d_particleContainer_->pressure_forces[pid + i * n_particles] = pid_prfs[i];
+            d_particleContainer_->viscosity_forces[pid + i * n_particles] = pid_visf[i];
+          }
         }
       }
     }
@@ -281,18 +324,18 @@ __global__ static void neighborKernel(
    */
 __host__ void callToNeighborSearch(
   spatialLookupTable *d_lookup_,
-  sphParticle *d_particles_,
+  particleContainer *d_particleContainer_,
   uint32_t n_partitions, 
   uint32_t n_particles,
   uint32_t containerCount[3],
   const float h 
 ) {
   uint32_t threadsPerBlock = 256; 
-  uint32_t gridSize = (n_partitions * threadsPerBlock - 1) / threadsPerBlock;
+  uint32_t gridSize = (n_particles * threadsPerBlock - 1) / threadsPerBlock;
 
   // Call to kernel
   neighborKernel<<<gridSize, threadsPerBlock>>>(
-    d_lookup_, d_particles_, n_partitions, n_particles, containerCount, h
+    d_lookup_, d_particleContainer_, n_partitions, n_particles, containerCount, h
   );
   cudaDeviceSynchronize();
   cudaError_t err = cudaGetLastError();
@@ -305,14 +348,15 @@ __host__ void callToNeighborSearch(
 /*
    Completes the first section of verlet integration
    */
-__global__ void firstVerletKernel(sphParticle *d_particles_, uint32_t n_particles) {
+__global__ void firstVerletKernel(particleContainer *d_particleContainer_, uint32_t n_particles) {
   uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
   if (idx >= n_particles) return;
 
   float forceSum[3] = {0.0, -9.81, 0.0};
 
   // Position and velocity update loop
-  for (int i = 0; i < 3; ++i) {     
+  for (int i = 0; i < 3; ++i) {
+    uint32_t co = idx + i * n_particles;
 #ifdef _debug 
     printf("! before !\nidx: %u\n  pos: <%f,%f,%f>\n  vel: <%f,%f,%f>\n",
       idx,
@@ -325,10 +369,10 @@ __global__ void firstVerletKernel(sphParticle *d_particles_, uint32_t n_particle
     );
 #endif
     // Sums the pressure and viscosity forces for each axis
-    forceSum[i] += (d_particles_[idx].pressure_force[i] + d_particles_[idx].viscosity_force[i]);
+    forceSum[i] += (d_particleContainer_->pressure_forces[co] + d_particleContainer_->viscosity_forces[co]);
     // Integrates the velocity and position
-    d_particles_[idx].velocity[i] += (forceSum[i] * static_cast<float>(0.5 * dt));
-    d_particles_[idx].position[i] += (d_particles_[idx].velocity[i] * static_cast<float>(dt));
+    d_particleContainer_->velocities[co] += (forceSum[i] * static_cast<float>(0.5 * dt));
+    d_particleContainer_->positions[co] += (d_particleContainer_->velocities[co] * static_cast<float>(dt));
 #ifdef _debug 
     printf("! after !\nidx: %u\n  pos: <%f,%f,%f>\n  vel: <%f,%f,%f>\n",
       idx,
@@ -346,7 +390,7 @@ __global__ void firstVerletKernel(sphParticle *d_particles_, uint32_t n_particle
 /*
    Second pass of verlet integration
    */
-__global__ void secondVerletKernel(sphParticle *d_particles_, uint32_t n_particles) {
+__global__ void secondVerletKernel(particleContainer *d_particleContainer_, uint32_t n_particles) {
   uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
 #ifdef _debug
   printf("Idx: %u\n", idx);
@@ -361,12 +405,14 @@ if (idx >= n_particles) return;
 
   float forceSum[3] = {0.0, -9.81, 0.0};
   for (int i = 0; i < 3; ++i) {
-    forceSum[i] += ((d_particles_[idx].pressure_force[i] + d_particles_[idx].viscosity_force[i]) / d_particles_[idx].mass);
+    uint32_t co = idx + i * n_particles;
+
+    forceSum[i] += ((d_particleContainer_->pressure_forces[co] + d_particleContainer_->viscosity_forces[co]) / d_particleContainer_->masses[idx]);
     
 #ifdef _debug
   printf("Force Sum %u: %f\n", idx, forceSum[i]); 
 #endif 
 
-    d_particles_[idx].velocity[i] += (forceSum[i] * static_cast<float>(0.5 * dt));
+    d_particleContainer_->velocities[co] += (forceSum[i] * static_cast<float>(0.5 * dt));
   }
 }

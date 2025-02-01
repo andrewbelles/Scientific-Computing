@@ -31,7 +31,7 @@ int main(int argc, char *argv[])
   // Local variables
   SDL_Event event;
   glm::vec3 center(cube_size / 2.0, cube_size / 2.0, cube_size / 2.0), position(1.0);
-  glm::vec3 view_position = glm::vec3(cube_size / 2.0, cube_size / 2.0, cube_size * 3.0);
+  glm::vec3 view_position = glm::vec3(cube_size / 2.0, cube_size / 2.0, cube_size * 10.0);
   glm::vec3 density_derived_color(0);
   glm::mat4 model(1.0), cube_model(1.0), sphere_model(1.0);
   bool lmb_down = false, initial_mouse = true;
@@ -43,8 +43,10 @@ int main(int argc, char *argv[])
   float particle_spacing = cube_size / cbrt(particle_count), h;
   float radius;
 
-  // Set the smoothingRadius and model radius 
-  h = (particle_spacing < 0.8) ? particle_spacing * alpha : 1.2; 
+  // Set the smoothing_radius and model radius 
+  h = (particle_spacing < 0.8) ? particle_spacing * alpha : 1.2;
+  // artificially lower smoothing radius as a test 
+  // h /= 2.5;
   radius = 0.2 * h;
   
   // Create shape meshes
@@ -57,7 +59,7 @@ int main(int argc, char *argv[])
   // Initialize the simulation
   uint32_t partition_count = 0;
   spatialLookupTable *d_lookup_ = nullptr;
-  sphParticle *d_particles_ = nullptr;
+  particleContainer *d_particleContainer_ = nullptr;
   // Unified positions
   float *u_positions = nullptr;
   float *u_densities = nullptr;
@@ -65,7 +67,7 @@ int main(int argc, char *argv[])
   // Call to initialization
   initalizeSimulation(
     &d_lookup_,
-    &d_particles_,
+    &d_particleContainer_,
     container,
     &partition_count,
     particle_count,
@@ -93,7 +95,7 @@ int main(int argc, char *argv[])
     // Update Position State
     particleIterator(
       d_lookup_,
-      d_particles_,
+      d_particleContainer_,
       &u_positions,
       &u_densities,
       container,
@@ -184,7 +186,7 @@ int main(int argc, char *argv[])
     for (int idx = 0; idx < particle_count; ++idx) {
       position = glm::vec3(
         u_positions[idx * 3],
-        u_positions[idx * 3 +1],
+        u_positions[idx * 3 + 1],
         u_positions[idx * 3 + 2]
       );
 
@@ -194,7 +196,7 @@ int main(int argc, char *argv[])
       density_derived_color = densityColor(u_densities[idx], rho0);
       sphere_gl.setColor(density_derived_color);
 
-      context_.shader_->camera_.lighting_.SetPosition(view_position + glm::vec3(0.0, 1.0, 0.0));
+      context_.shader_->camera_.lighting_.SetPosition(center + glm::vec3(0.0, 5.0 + center.y, 0.0));
       context_.shader_->Render(fov, aspect_ratio, near_plane, far_plane, sphere_gl.object_color_, sphere_model);
       sphere_gl.DrawSphere();
     }
@@ -208,7 +210,7 @@ int main(int argc, char *argv[])
   }
 
   // Free gpu memory
-  cudaFree(d_particles_);
+  delete (d_particleContainer_);
   cudaFree(u_positions);
   cudaFree(d_lookup_);
 

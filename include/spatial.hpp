@@ -2,6 +2,7 @@
 #define __SPATIAL_HPP__
 
 // Cuda headers
+#include <cstdio>
 #include <cuda_runtime_api.h>
 #include <device_launch_parameters.h>
 
@@ -11,6 +12,8 @@
 #include <cmath>
 #include <iostream>
 #include <cstdint>
+
+#define tol 1e-4
 
 /**
  * Single entry into key/id paired table
@@ -29,37 +32,146 @@ struct spatialLookupTable {
   uint32_t *end_cell;
 }; 
 
-/**
- * Class : getKey, hashFunc(?) 
- * Single sph fluid particle to be placed in GPU memory
+/*
+ * Refactor: 
+ * Update particle class to better coalesce memory
+ * Only one particle class will be constructed
+ * Each member will be initialized as malloc managed, filled, and sent to GPU
+ * The class will store the specific device ptr instead of individual data values per struct 
+ *
+ * In general this is a conversion from an array of structures to a structure of arrays 
+ * to better match GPU memory access
  */
-class sphParticle {
- public: 
-  float position[3];
-  float velocity[3];
-  float pressure_force[3];
-  float viscosity_force[3];
-  float mass;
-  float density;
-  float pressure;
 
-  // Handle vector allocation in GPU later (?)
-  sphParticle(float min, float max) : mass(1.0), density(0.0), pressure(0.0) {
-    // Seed rng using system time
-    uint32_t seed = std::chrono::system_clock::now().time_since_epoch().count();
-    std::mt19937 gen(seed);
-    std::uniform_real_distribution<float> pos_dis(min, max), vel_dis(-max / 20.0, max / 20.0);
-    
-    // Initialization
-    for (int i = 0; i < 3; ++i) {
-      velocity[i]        = vel_dis(gen);
-      pressure_force[i]  = 0.0;
-      viscosity_force[i] = 0.0;
-      
-      // Randomly distributed
-      position[i] = pos_dis(gen);
-    }  
+class particleContainer {
+ public:
+  float *positions;
+  float *velocities;
+  float *pressure_forces;
+  float *viscosity_forces; // 3D flattened to 1D of size n_particles * 3
+  float *masses;
+  float *densities;
+  float *pressures; // Flat arrays of size n_particles
+
+  // Base constructor (if resized)
+  particleContainer() {
+    positions         = nullptr;
+    velocities       = nullptr;
+    pressure_forces  = nullptr;
+    viscosity_forces = nullptr;
+    masses           = nullptr;
+    densities        = nullptr;
+    pressures        = nullptr;
   }
+
+  // Default constructor to create ptrs on host to be transfered to device 
+  // Assumes each individual ptr has already been allocated as mallocmanaged
+  particleContainer(
+    float *u_pos, 
+    float *u_vel, 
+    float *u_prf,
+    float *u_visf,
+    float *u_mass,
+    float *u_dens,
+    float *u_pr,  // Unified ptrs to be set in value
+    uint32_t n_particles,
+    float min,
+    float max
+  ) {
+    uint32_t seed = std::chrono::system_clock::now().time_since_epoch().count();
+    gen = std::mt19937(seed);
+    pos_dis = std::uniform_real_distribution<float>(min, max);
+    vel_dis = std::uniform_real_distribution<float>(-max / 20.0, max / 20.0);
+
+    for (uint32_t i = 0; i < n_particles; ++i) {
+      // Handle 3D flattened vectors 
+      for (int j = 0; j < 3; ++j) {
+          uint32_t idx = n_particles * j + i;
+          // Set vals
+          u_pos[idx]  = pos_dis(gen);
+          u_vel[idx]  = vel_dis(gen);
+          u_prf[idx]  = 0.0;
+          u_visf[idx] = 0.0;
+      }
+
+      // Handle 1D vectors
+      u_mass[i] = 1.0;
+      u_dens[i] = tol;
+      u_pr[i]   = 0.0;
+    }
+    
+    // Set ptrs in class
+    positions        = u_pos;
+    velocities       = u_vel;
+    pressure_forces  = u_prf;
+    viscosity_forces = u_visf;
+    masses           = u_mass;
+    densities        = u_dens;
+    pressures        = u_pr;
+  }
+
+  // Add new position and velocities for new particles if resized
+  void addNewParticles(
+    float *n_pos,
+    float *n_vel,
+    uint32_t oldSize,
+    uint32_t newSize,
+    float min,
+    float max
+  ) { 
+    // Create new position and velocity values
+    for (uint32_t idx = oldSize; idx < newSize; ++idx) {
+      for (int j = 0; j < 3; ++j) {
+        uint32_t co = j * newSize + idx;
+        n_pos[co] = pos_dis(gen);
+        n_vel[co] = vel_dis(gen);
+      }
+    }
+  }
+
+  // Set accumulator values to base if array was resized 
+  void slowSetAccumulators(
+    float *u_prf,
+    float *u_visf,
+    float *u_mass,
+    float *u_dens,
+    float *u_pr,
+    uint32_t n_particles
+  ) {
+    for (uint32_t i = 0; i < n_particles; ++i) {
+      
+      for (int j = 0; j < 3; ++j) {
+        uint32_t idx = j * n_particles + i;
+        u_prf[idx]  = 0.0;
+        u_visf[idx] = 0.0;
+      }
+
+      u_mass[i] = 1.0;
+      u_dens[i] = tol;
+      u_pr[i]   = 0.0;
+    }
+
+    // Set accumulators
+    pressure_forces = u_prf;
+    viscosity_forces = u_visf;
+    masses = u_mass;
+    densities = u_dens;
+    pressures = u_pr;
+  }
+
+  // Default destructor
+  ~particleContainer() {
+    cudaFree(positions);
+    cudaFree(velocities);
+    cudaFree(pressure_forces);
+    cudaFree(viscosity_forces);
+    cudaFree(masses);
+    cudaFree(densities);
+    cudaFree(pressures);
+  }
+ private:
+  std::mt19937 gen;
+  std::uniform_real_distribution<float> pos_dis, vel_dis; 
 };
 
 /* Function prototypes */
@@ -80,7 +192,7 @@ __host__ void bitonicSort(spatialLookupTable *d_lookup_, uint32_t paddedSize);
 
 __host__ void hostFillTable(
   spatialLookupTable *d_lookup_,
-  sphParticle *d_particles_,
+  particleContainer *d_particleContainer_,
   uint32_t n_partitions,
   uint32_t n_particles,
   uint32_t paddedSize,
@@ -89,7 +201,7 @@ __host__ void hostFillTable(
 
 __host__ void initalizeSimulation(
   spatialLookupTable **d_lookup_,
-  sphParticle **d_particles_,
+  particleContainer **d_particleContainer_,
   const std::vector<float> container,
   uint32_t *n_partitions,
   uint32_t n_particles,

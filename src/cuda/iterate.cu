@@ -8,13 +8,13 @@
 
 #define _errorcheck
 #define substep 1
-#define tol 1e-3
+#define tol 1e-4
 // #define _debug
 // #define _verbose
 
-__global__ static void printPositions(sphParticle *d_particles_, uint32_t n_particles) {  
-  uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
-  if (idx >= n_particles) return;
+// __global__ static void printPositions(sphParticle *d_particles_, uint32_t n_particles) {  
+//  uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
+//  if (idx >= n_particles) return;
 
 #ifdef _verbose
     printf("idx: %u : <%f,%f,%f>\n",
@@ -24,24 +24,27 @@ __global__ static void printPositions(sphParticle *d_particles_, uint32_t n_part
       d_particles_[idx].position[2]
     );
 #endif
-}
+// }
 
-__global__ static void setAccumulators(sphParticle *d_particles_, uint32_t n_particles) {
+__global__ static void setAccumulators(particleContainer *d_particleContainer_, uint32_t n_particles) {
   uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
   if (idx >= n_particles) return;
 
   // Quickly reset all acculated values from previous iteration
-  d_particles_[idx].density  = tol;
-  d_particles_[idx].pressure = 0.0;
+  d_particleContainer_->densities[idx]  = tol;
+  d_particleContainer_->pressures[idx]  = 0.0;
   for (int i = 0; i < 3; ++i) {
-    d_particles_[idx].pressure_force[i]  = 0.0;
-    d_particles_[idx].viscosity_force[i] = 0.0;
+
+    uint32_t co = idx + i * n_particles;
+
+    d_particleContainer_->pressure_forces[co]  = 0.0;
+    d_particleContainer_->viscosity_forces[co] = 0.0;
   }
 }
 
 /* Copies positions into contiguous device buffer */ 
 __global__ static void updateHostBuffer(
-  sphParticle *d_particles_,
+  particleContainer *d_particleContainer_,
   float *u_positions,
   float *u_densities,
   uint32_t n_particles
@@ -50,9 +53,9 @@ __global__ static void updateHostBuffer(
   uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
   if (idx >= n_particles) return;
 
-  u_densities[idx] = d_particles_[idx].density;
+  u_densities[idx] = d_particleContainer_->densities[idx];
   for (int i = 0; i < 3; ++i) {
-    u_positions[idx * 3 + i] = d_particles_[idx].position[i];
+    u_positions[idx * 3 + i] = d_particleContainer_->positions[idx + i * n_particles];
 #ifdef _debug  
     printf("Position %d for idx: %u : %f\n",
       i, idx, d_positions[idx * 3 + i]
@@ -64,7 +67,7 @@ __global__ static void updateHostBuffer(
 /* Generates positions from particle array */
 __host__ void particleIterator(
   spatialLookupTable *d_lookup_,
-  sphParticle *d_particles_, 
+  particleContainer *d_particleContainer_, 
   float **u_positions,
   float **u_densities,
   std::vector<float> container,
@@ -75,29 +78,37 @@ __host__ void particleIterator(
 {
   uint32_t threadsPerBlock = 256;
   uint32_t gridSize = (n_particles + threadsPerBlock - 1) / threadsPerBlock;
+  uint32_t verletGrid = (gridSize < 30) ? 30 : gridSize;
+  // threadsPerBlock ~= (n_particles - 1) / (verletGrid - 1) -> findSquare()
+  uint32_t verletTPB = findSquare((n_particles - 1) / (verletGrid - 1));
+
 #ifdef _verbose  
   printPositions<<<gridSize, threadsPerBlock>>>(d_particles_, n_particles);
 #endif
   // Update bounds if container or particle count have changed
-  updateBounds(d_lookup_, d_particles_, container, n_particles, h);
+  updateBounds(d_lookup_, d_particleContainer_, container, n_particles, h);
 
   struct Container boundary = {
     .lower = {0.0, 0.0, 0.0},
     .upper = {container[0], container[1], container[2]}
   };
 
-  setAccumulators<<<gridSize, threadsPerBlock>>>(d_particles_, n_particles);
-  
+  setAccumulators<<<gridSize, threadsPerBlock>>>(d_particleContainer_, n_particles);
+
+  // Set lookup spatialLookupTable for new positions 
+  uint32_t padded_size = findSquare(n_particles);
+  hostFillTable(d_lookup_, d_particleContainer_, n_partitions, n_particles, padded_size, h);
+
   // Checking boundary conditions is breaking the particles positions...
   
   // Only one static boundary for now (the container itself)
   for (int i = 0; i < substep; ++i) { 
-    callToBoundaryConditions(boundary, d_particles_, n_particles, n_partitions, h);
+    callToBoundaryConditions(boundary, d_particleContainer_, n_particles, n_partitions, h);
   }
 #ifdef _verbose
   printPositions<<<gridSize, threadsPerBlock>>>(d_particles_, n_particles);
 #endif
-  firstVerletKernel<<<gridSize, threadsPerBlock>>>(d_particles_, n_particles);
+  firstVerletKernel<<<verletGrid, verletTPB>>>(d_particleContainer_, n_particles);
   cudaDeviceSynchronize();
 #ifdef _errorcheck
   cudaError_t verletErr = cudaGetLastError();
@@ -124,7 +135,7 @@ __host__ void particleIterator(
   // Calls the neighbor search
   callToNeighborSearch(
     d_lookup_,
-    d_particles_,
+    d_particleContainer_,
     n_partitions,
     n_particles,
     containerCount,
@@ -132,7 +143,7 @@ __host__ void particleIterator(
   );
 
   // Second verlet pass with new force values
-  secondVerletKernel<<<gridSize, threadsPerBlock>>>(d_particles_, n_particles);
+  secondVerletKernel<<<verletGrid, verletTPB>>>(d_particleContainer_, n_particles);
 #ifdef _errorcheck
   verletErr = cudaGetLastError();
   if (verletErr != cudaSuccess) {
@@ -162,7 +173,7 @@ __host__ void particleIterator(
   }
 
   // Creates single contiguous bufr of floats (for positions)
-  updateHostBuffer<<<gridSize, threadsPerBlock>>>(d_particles_, (*u_positions), (*u_densities), n_particles);
+  updateHostBuffer<<<gridSize, threadsPerBlock>>>(d_particleContainer_, (*u_positions), (*u_densities), n_particles);
 
 #ifdef _errorcheck 
   cudaError_t launchErr = cudaGetLastError();

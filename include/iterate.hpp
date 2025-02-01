@@ -7,7 +7,7 @@
 
 __host__ void particleIterator(
   spatialLookupTable *d_lookup_,
-  sphParticle *d_particles_,
+  particleContainer *d_particleContainer_,
   float **u_positions,
   float **u_densities,
   std::vector<float> container,

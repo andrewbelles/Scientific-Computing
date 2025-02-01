@@ -92,42 +92,47 @@ __device__ uint32_t hashPosition(const uint32_t cell_coord[3], uint32_t n_partit
   return hash % n_partitions;
 }
 
+
+__global__ static void fillSentinelKernel(spatialLookupTable *d_lookup_, uint32_t n_partitions) { 
+  uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
+  if (idx >= n_partitions) return;
+
+  d_lookup_->start_cell[idx] = UINT32_MAX;
+  d_lookup_->end_cell[idx]   = UINT32_MAX;
+}
+
 /**
  * Kernel to quickly insert all particle positions into the lookup hashmap unordered
  */
 __global__ static void insertTableKernel(
     spatialLookupTable *d_lookup_,
-    sphParticle *d_particles_,
+    particleContainer *d_particleContainer_,
     uint32_t n_particles,
     uint32_t n_partitions,
-    uint32_t paddedSize,
+    uint32_t padded_size,
     const float h
 ) {
   uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
-  // Return before inserting at idx for lookup table
-  if (idx >= n_partitions) return;
+  if (idx >= n_particles) return;
+  // Find hash value 
+  uint32_t cell_coord[3];
+  
+  float local_pos[3] = {
+    d_particleContainer_->positions[idx],
+    d_particleContainer_->positions[idx + n_particles],
+    d_particleContainer_->positions[idx + 2 * n_particles]
+  };
 
-  // Set Start and end cell to sentinel value 
-  d_lookup_->start_cell[idx] = UINT32_MAX;
-  d_lookup_->end_cell[idx]   = UINT32_MAX;
+  positionToCellCoord(cell_coord, local_pos, h);
+  uint32_t hash = hashPosition(cell_coord, n_partitions);
 
-  // Return for values larger than table size 
-  if (idx >= paddedSize) return;
-
-  // If in valid range
-  if (idx < n_particles) {
-    // Find hash value 
-    uint32_t cell_coord[3];
-    positionToCellCoord(cell_coord, d_particles_[idx].position, h);
-    uint32_t hash = hashPosition(cell_coord, n_partitions);
-
-    // Fill table for idx
+  // Fill table for idx
+  if (idx >= padded_size) {  
+    d_lookup_->start_cell[idx] = UINT32_MAX;
+    d_lookup_->end_cell[idx]   = UINT32_MAX;
+  } else {
     d_lookup_->table_[idx].idx      = idx;
     d_lookup_->table_[idx].cell_key = hash;
-  } else {
-    // Pad extra values with sentinel values
-    d_lookup_->table_[idx].idx      = UINT32_MAX;
-    d_lookup_->table_[idx].cell_key = UINT32_MAX; 
   }
 }
 
@@ -225,16 +230,19 @@ __global__ void printTable(spatialLookupTable *d_lookup_, uint32_t n_partitions,
 /**
  * Host function to call individual kernels to set values of table 
  */
-__host__ void hostFillTable(spatialLookupTable *d_lookup_, sphParticle *d_particles_, uint32_t n_partitions, uint32_t n_particles, uint32_t paddedSize, const float h) {
+__host__ void hostFillTable(spatialLookupTable *d_lookup_, particleContainer *d_particleContainer_, uint32_t n_partitions, uint32_t n_particles, uint32_t paddedSize, const float h) {
   // Might not be optimal as there are a maximum number of threads and is inflexible
   uint32_t threadsPerBlock = 256;
   uint32_t insertSize = (n_partitions + threadsPerBlock - 1) / threadsPerBlock;
   uint32_t tableSize = (paddedSize + threadsPerBlock - 1) / threadsPerBlock;
   cudaError_t err;
+
+  fillSentinelKernel<<<insertSize, threadsPerBlock>>>(d_lookup_, n_partitions);
+
   // Call to kernel to fill table
-  insertTableKernel<<<insertSize, threadsPerBlock>>>(
+  insertTableKernel<<<tableSize, threadsPerBlock>>>(
     d_lookup_,
-    d_particles_,
+    d_particleContainer_,
     n_particles,
     n_partitions,  
     paddedSize,
@@ -271,7 +279,7 @@ __host__ void hostFillTable(spatialLookupTable *d_lookup_, sphParticle *d_partic
  */
 __host__ void initalizeSimulation(
     spatialLookupTable **d_lookup_,
-    sphParticle **d_particles_,
+    particleContainer **d_particleContainer_,
     const std::vector<float> container,
     uint32_t *n_partitions,
     uint32_t n_particles,
@@ -356,42 +364,52 @@ __host__ void initalizeSimulation(
      to the GPU once it is dereferenced on the GPU. It will stay there unless
      dereferenced
   */
-  err = cudaMallocManaged(d_particles_, n_particles * sizeof(sphParticle));
-  if (err != cudaSuccess) {
-    std::cerr << "Malloc Error: " << cudaGetErrorString(err) << '\n';
-    exit(EXIT_FAILURE);
-  }
-#ifdef _debug
-  std::cout << "Malloc Completion\n";
-#endif
-  for (uint32_t i = 0; i < n_particles; ++i) { 
-    new (&(*d_particles_)[i]) sphParticle(minimum, maximum);
-#ifdef _debug 
-    printf("position: <%f, %f, %f>\n",
-      (*d_particles_)[i].position[0],
-      (*d_particles_)[i].position[1],
-      (*d_particles_)[i].position[2]
-    );
-#endif
-  }
+
+  // Coalesced device ptrs 
+  float *u_pos, *u_vel, *u_prf, *u_visf, *u_mass, *u_dens, *u_pr;
+  cudaMallocManaged(&u_pos, n_particles * 3 * sizeof(float));
+  cudaMallocManaged(&u_vel, n_particles * 3 * sizeof(float));
+  cudaMallocManaged(&u_prf, n_particles * 3 * sizeof(float));
+  cudaMallocManaged(&u_visf, n_particles * 3 * sizeof(float));
+  cudaMallocManaged(&u_mass, n_particles * sizeof(float));
+  cudaMallocManaged(&u_dens, n_particles * sizeof(float));
+  cudaMallocManaged(&u_pr, n_particles * sizeof(float));
+
+  // Refactor: handle particle construction differently for SoA initialization
+  cudaMallocManaged(d_particleContainer_, sizeof(particleContainer));
+
+  // Set only value in d_particleContainer_ to constructor
+  new (*d_particleContainer_) particleContainer(
+    u_pos, 
+    u_vel,
+    u_prf,
+    u_visf,
+    u_mass,
+    u_dens,
+    u_pr,
+    n_particles,
+    minimum,
+    maximum
+  );
+  
 
 #ifdef _debug
   std::cout << "Constructed array\n";
 #endif
 #ifdef _debug
-  std::cout << "Test Mass: " << d_particles_[0]->mass << '\n'; // Check if constructed
+  std::cout << "Test Mass: " << (*d_particleContainer_)->masses[0] << '\n'; // Check if constructed
 #endif
 
   // If this seg faults the program its on the gpu (maybe?)
 #ifdef _debug
-  std::cout << "Test Mass: " << d_particles_[0]->mass << '\n'; // Check if constructed
+  std::cout << "Test Mass: " << (*d_particleContainer_)->masses[0] << '\n'; // Check if constructed
   std::cout << "Check complete\n";
 #endif
 
   // Call to host function to fill table with values 
   hostFillTable(
     (*d_lookup_),
-    (*d_particles_),
+    (*d_particleContainer_),
     (*n_partitions),
     n_particles,
     paddedSize,
