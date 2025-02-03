@@ -1,7 +1,10 @@
 #include "integrate.hpp"
+#include "spatial.hpp"
 #include <cstdlib>
 #include <cuda_runtime_api.h>
+#include <device_atomic_functions.h>
 #include <driver_types.h>
+#include <vector_functions.h>
 
 // Defines 
 #define k 3000
@@ -9,41 +12,45 @@
 #define dt 1e-3       // Change to dynamically shift in value 
 #define viscosity 1e-2
 
-// #define _debug
-//#define _verbose
+// Offset table for kernel 
+__constant__ int3 offset_table[27];
 
-template <typename T>
-#ifdef _debug 
-__device__ static inline void relativeDisplacement(T a[3], const T b[3]) {
-  for (int i = 0; i < 3; ++i) {
-    printf("a[%d]: %f, b[%d]: %f\n", i, a[i], i, b[i]);
-    a[i] -= b[i];
-    printf("result: %f\n", a[i]);
-  }
+__device__ int global_offset; 
+
+__device__ static inline float magnitude(const float3 a) {
+  return sqrtf(a.x * a.x + a.y * a.y + a.z * a.z);
 }
-#else
-__device__ static inline void relativeDisplacement(T a[3], const T b[3]) {
+
+/* float3 overloads */
+
+__host__ __device__ static inline float3 operator/(const float3 a, const float val) {
+  return make_float3(a.x / val, a.y / val, a.z / val);
+}
+
+__host__ __device__ static inline float3 operator*(const float3 a, const float val) {
+  return make_float3(a.x * val, a.y * val, a.z * val);
+}
+
+__host__ __device__ static inline void operator+=(float3 &a, float3 b) {
+  float *vec_a[] = {&a.x, &a.y, &a.z};
+  float *vec_b[] = {&b.x, &b.y, &b.z};
+
   for (int i = 0; i < 3; ++i)
-    a[i] -= b[i];
-}
-#endif
-
-template <typename T>
-__device__ static inline float magnitude(T arr[3]) {
-  return sqrt(arr[0] * arr[0] + arr[1] * arr[1] + arr[2] * arr[2]);
+    *vec_a[i] += *vec_b[i];
 }
 
-template <typename T>
-__device__ static inline void assign(T arr1[3], const T arr2[3]) {
+__host__ __device__ static inline float3 operator-(const float3 a, const float3 b) {
+  return make_float3(a.x - b.z, a.y - b.z, a.z - b.z);
+}
+
+__host__ __device__ static inline void operator-=(float3 &a, float3 b) {
+  float *vec_a[] = {&a.x, &a.y, &a.z};
+  float *vec_b[] = {&b.x, &b.y, &b.z};
+
   for (int i = 0; i < 3; ++i)
-    arr1[i] = arr2[i];
+    *vec_a[i] -= *vec_b[i];
 }
 
-template <typename T>
-__device__ static inline void sum(T arr1[3], const T arr2[3]) {
-  for (int i = 0; i < 3; ++i)
-    arr1[i] += arr2[i];
-}
 /*
    Cubic Spline smooth field approximating kernel. 
    */
@@ -106,241 +113,318 @@ __host__ __device__ float laplacianCubicSpline(float distance, float smooth_radi
   return value;
 }
 
-/*
-   Calculates the intermediate value from the displacement vector for the pressure force on a particle
-   */
-__device__ static void calculatePressureForce(float displacement[3], float rel_mass, float src_density, float rel_density, float kernel_val) { 
-  for (int i = 0; i < 3; ++i) {
-#ifdef _verbose
-    printf("before disp[%d]: %f\n", i, displacement[i]);
-#endif
-    displacement[i] *= ((rel_mass * (src_density + rel_density)) / (2.0 * src_density * rel_density));
-    displacement[i] *= -kernel_val;
-#ifdef _verbose
-    printf("pressure force [%d]: %f\n", i, displacement[i]);
-#endif
-  }
+/**
+ * Create the offset table and copy symbol to GPU memory 
+ */ 
+__host__ void initOffsetTable() {
+  int3 host_offset[27];
+
+  int idx = 0;
+  // Iterate over 3x3x3 grid 
+  for (int dz = -1; dz <= 1; ++dz)
+    for (int dy = -1; dy <= 1; ++dy)
+      for (int dx = -1; dx <= 1; ++dx, ++idx)
+        host_offset[idx] = make_int3(dx, dy, dz);  
+
+  // Copy the host table to the global constant offset table
+  cudaMemcpyToSymbol(offset_table, host_offset, sizeof(host_offset));
 }
 
-/*
-   Calculates the intermediate value from the velocity difference vector for the viscosity force on a particle 
-   */ 
-__device__ static void calculateViscosityForce(float velocity_difference[3], float rel_mass, float kernel_val) {
-  // intermediate_value = velocity_difference * (viscosity * particles[rel].mass * laplacianCubicSpline(distance, d_consts.h));
-  for (int i = 0; i < 3; ++i) {
-#ifdef _verbose
-    printf("before vel_diff[%d]: %f\n", i, velocity_difference[i]);
-#endif
-    velocity_difference[i] *= (viscosity * rel_mass * kernel_val);
-#ifdef _verbose 
-    printf("visc force[%d]: %f\n", i, velocity_difference[i]);
-#endif
-  }
+__device__ static inline bool inBounds(const int3 a, const uint32_t bounds[3]) {
+  if (a.x >= bounds[0] || a.x < 0 || a.y >= bounds[1] || a.y < 0 || a.z >= bounds[2] || a.z < 0) return false;
+  return true;
 }
 
-/*
-   Kernel to determine the neighbors of each particle and the forces acting upon it
-   */
-__global__ static void neighborKernel(
+/**
+ * Operator for int3 adding
+ */
+__device__ static inline int3 operator+(int3 a, int3 b) {
+  return make_int3(a.x + b.x, a.y + b.y, a.z + b.z);
+}
+
+__global__ static void computeNeighborList(
   spatialLookupTable *d_lookup_,
   particleContainer *d_particleContainer_,
-  uint32_t n_partitions, 
+  uint32_t *neighbors,
+  uint32_t *neighbor_offset,
+  int *neighbor_count,
+  uint32_t n_partitions,
   uint32_t n_particles,
   uint32_t containerCount[3],
-  const float h 
+  uint32_t list_size,
+  int *status,
+  const float h
 ) {
+  extern __shared__ uint32_t shared_cell[];
+
+  uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
+
+  if (idx >= n_particles) return;
+
+  // Fetch particle id associated with table
+  uint32_t pid = d_lookup_->table_[idx].idx;
+  uint32_t start = 0, end = 0, hash = 0, rel = 0, idj = 0;
+  float3 displace, relative_pos, local_pos;
+  float distance = 0.0;
+  int3 relative_coord, cell_coord;
+  int count = 0, offset = 0, block_end = 0;
+
+  // Convert local position to float3 type 
+  local_pos = make_float3(
+    d_particleContainer_->positions[pid],
+    d_particleContainer_->positions[pid + 1 * n_particles],
+    d_particleContainer_->positions[pid + 2 * n_particles]
+  );
+
+  // Collect the cell coordinate
+  cell_coord = positionToCellCoord(
+    local_pos,
+    h
+  );
+
+  // Take two passes; once to calculate the offset for each idx then again to actually fill neighbors array 
+  for (int pass = 0; pass < 2; ++pass) {
+    count = 0;
+    for (int i = 0; i < 27; ++i) {
+      // Find offset position from table
+      relative_coord = cell_coord + offset_table[i];
+
+      if (!inBounds(relative_coord, containerCount)) continue;
+
+      // Find hash of offset position and subsequent rel ids
+      hash = hashPosition(relative_coord, n_partitions);
+      start = d_lookup_->start_cell[hash];
+      end   = d_lookup_->end_cell[hash];
+
+      for (uint32_t j = start; j < end; j += blockDim.x) {
+        idj = j + threadIdx.x;  
+        if (idj < end) shared_cell[threadIdx.x] = d_lookup_->table_[idj].idx;
+        __syncthreads();
+
+        block_end = (end - j < blockDim.x) ? end - j : blockDim.x;
+
+        for (int t = 0; t < block_end; ++t) {
+          rel = shared_cell[t];
+
+          if (rel == pid) continue;
+
+          relative_pos = make_float3( 
+            d_particleContainer_->positions[rel],
+            d_particleContainer_->positions[rel + 1 * n_particles],
+            d_particleContainer_->positions[rel + 2 * n_particles]
+          );
+
+          displace = local_pos - relative_pos;
+          distance = magnitude(displace);
+
+          if (distance > 2.0 * h) continue; 
+          
+          if (pass == 0) { 
+            count++;  // Collect count of neighbors for each idx
+          } else {
+            if (offset + count >= list_size) {
+              atomicExch(status, 1); 
+              return; 
+            }
+
+            neighbors[offset + count] = rel;
+            count++;
+          }
+        }
+        __syncthreads();
+      }
+    }
+
+    if (pass == 0) {
+      offset = atomicAdd(&global_offset, count);
+      neighbor_offset[idx] = offset;
+    }
+  }
+
+  // Increment the offset for the neighbors array 
+  atomicAdd(neighbor_count, count);
+  printf("Neighbor Count: %d\n", (*neighbor_count));
+}
+
+/**
+ * Find the density, pressure, and system forces from the built neighbor list
+ */
+__global__ static void computeForces(
+  uint32_t *neighbors,
+  uint32_t *neighbor_offset,
+  particleContainer *d_particleContainer_,
+  uint32_t n_particles,
+  const float h
+) { 
   uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
   if (idx >= n_particles) return; 
 
-  // Thread's particle id
-  uint32_t pid = d_lookup_->table_[idx].idx;
+  // Set local values
+  float3 pressure_force  = make_float3(0.0, 0.0, 0.0);
+  float3 viscosity_force = make_float3(0.0, 0.0, 0.0);
+  float3 local_pos = make_float3(
+    d_particleContainer_->positions[idx],
+    d_particleContainer_->positions[idx + n_particles],
+    d_particleContainer_->positions[idx + 2 * n_particles]
+  );
+ 
+  float3 local_vel = make_float3(
+    d_particleContainer_->velocities[idx],
+    d_particleContainer_->velocities[idx + n_particles],
+    d_particleContainer_->velocities[idx + 2 * n_particles]
+  );
 
-  uint32_t cell_coord[3], relative_coord[3];
-  uint32_t start, end, hash, rel;
-  bool invalidCell = false; 
+  // Iterator bounds
+  uint32_t start = neighbor_offset[idx];
+  uint32_t end   = neighbor_offset[idx + 1];
 
-  float displacement[3], velocity_difference[3], distance = 0.0, kernel_val = 0.0;
-
-  // print expected container maxes
-#ifdef _debug
-  printf("idx: %u\n", idx);
-  if (idx == 0) {
-    printf("cct: <%u, %u, %u>\n",
-      containerCount[0],
-      containerCount[1],
-      containerCount[2]
+  // Loop over neighbor indexes
+  for (uint32_t i = start; i < end; ++i) {
+    // Set the relative particle id
+    uint32_t rel = neighbors[i];
+    
+    float3 relative_pos = make_float3(
+      d_particleContainer_->positions[rel],
+      d_particleContainer_->positions[rel + n_particles],
+      d_particleContainer_->positions[rel + 2 * n_particles] 
     );
+
+    // Find distance
+    float3 displace = local_pos - relative_pos;
+    float distance  = magnitude(displace);
+
+    float3 relative_vel = make_float3( 
+      d_particleContainer_->velocities[idx],
+      d_particleContainer_->velocities[idx + n_particles],
+      d_particleContainer_->velocities[idx + 2 * n_particles]
+    );
+
+    // Find density sum
+    d_particleContainer_->densities[idx] += d_particleContainer_->masses[rel] * cubicSpline(distance, h);
+    d_particleContainer_->pressures[idx] = k * (d_particleContainer_->densities[idx] - rho0);
+
+    // Unit vector of direction calculatio 
+    float3 direction = displace / (distance + tol);
+    pressure_force  -= (direction * (d_particleContainer_->pressures[idx] + d_particleContainer_->pressures[rel]) * gradCubicSpline(distance, h));
+    viscosity_force += (((local_vel - relative_vel) * d_particleContainer_->masses[rel] / d_particleContainer_->densities[rel]) * laplacianCubicSpline(distance, h));
   }
-#endif
-  // Create cell coordinate at pid's position
-  float local_pos[3] = {
-    d_particleContainer_->positions[pid],
-    d_particleContainer_->positions[pid + n_particles],
-    d_particleContainer_->positions[pid + 2 * n_particles],
-  };    // Declared here to leverage static initialization
-  positionToCellCoord(cell_coord, local_pos, h);
+  float *pressure_force_arr[]  = {&pressure_force.x, &pressure_force.y, &pressure_force.z};
+  float *viscosity_force_arr[] = {&viscosity_force.x, &viscosity_force.y, &viscosity_force.z};
 
-  // Iterate around the cell coordinate
-  for (int dz = -1; dz <= 1; ++dz) {
-    for (int dy = -1; dy <= 1; ++dy) {
-      for (int dx = -1; dx <= 1; ++dx) {
-        invalidCell = false; 
-        int offset[3] = {dx, dy, dz};
-#ifdef _debug
-        printf("idx: %u, offset: <%d,%d,%d>\n", idx, offset[0], offset[1], offset[2]);
-#endif
-        // Find the relative cell coordinate for iter
-        for (int i = 0; i < 3; ++i) {
-          // Avoid unsigned int overflow
-          if (cell_coord[i] == 0 && offset[i] == -1) {
-            invalidCell = true;
-            continue;
-          }
-
-          // Find relative cell coord 
-          relative_coord[i] = cell_coord[i] + offset[i];
-#ifdef _debug
-          printf("idx: %u, rel: <%u,%u,%u>\n", 
-            idx,
-            relative_coord[0],
-            relative_coord[1],
-            relative_coord[2]
-          );
-#endif
-          // Check if invalid
-          if (relative_coord[i] >= containerCount[i]) {
-            invalidCell = true;
-          }
-        }
-
-        // If any of the relative coordinates are out of bounds
-        if (invalidCell) continue;
-
-        // Find relative cell coordinates hash value
-        hash = hashPosition(relative_coord, n_partitions);
-#ifdef _debug 
-        printf("idx: %u, hash: %u\n", idx, hash);
-#endif
-        // Find start and stop indexes for lookup table
-        start = d_lookup_->start_cell[hash];
-        end   = d_lookup_->end_cell[hash];
-
-        // Empty bucket 
-        if (start > n_particles || end > n_particles) continue;
-        if (start > end) {
-          printf("Start/End discrepency\n");
-          return;
-        }
-        // I want to assume that this works through this point (?) the third condition in the empty check above
-        // theoretically shouldn't need to be there and it if it was true I'd want to exit(fail)
-        // I guess I'm unsure that the hash function is correctly placing each particle into their respective bucket wo collision
-
-        // Iterate over all particles in current bucket
-        for (uint32_t i = start; i < end; ++i) {
-          rel = d_lookup_->table_[i].idx; 
-          if (rel >= n_particles) printf("wtf\n"); // shouldn't be an issue anymore -> so far hasn't been 
-          if (rel == pid) continue; 
-
-          float local_vel[3] = {
-            d_particleContainer_->positions[pid],
-            d_particleContainer_->positions[pid + n_particles],
-            d_particleContainer_->positions[pid + 2 * n_particles],
-          };
-
-          float rel_pos[3] = {
-            d_particleContainer_->positions[rel],
-            d_particleContainer_->positions[rel + n_particles],
-            d_particleContainer_->positions[rel + 2 * n_particles],
-          };
-
-          float rel_vel[3] = {
-            d_particleContainer_->velocities[rel],
-            d_particleContainer_->velocities[rel + n_particles],
-            d_particleContainer_->velocities[rel + 2 * n_particles],
-          };
-
-          // Copies position to displacement and finds the vector displacement between src and rel 
-          assign(displacement, local_pos);
-          relativeDisplacement(displacement, rel_pos);
-#ifdef _debug
-          for (int i = 0; i < 3; ++i)
-            if (displacement[i] > 10.0) printf("Error on idx %u for pid %u of displacement [%d]: %f\n", idx, pid, i, displacement[i]);
-#endif
-          distance = magnitude(displacement);    
-#ifdef _debug 
-          if (distance > 10.0) printf("Error on idx %u for pid %u!\n", idx, pid);
-          printf("idx: %u, distance: %f\n", idx, distance);
-#endif
-          // Not neighbors -> continue 
-          if (distance > (2.0 * h)) continue;
-
-          float pid_prfs[3] = {
-            d_particleContainer_->pressure_forces[pid],
-            d_particleContainer_->pressure_forces[pid + n_particles],
-            d_particleContainer_->pressure_forces[pid + 2 * n_particles],
-          };
-
-          float pid_visf[3] = {
-            d_particleContainer_->viscosity_forces[pid],
-            d_particleContainer_->viscosity_forces[pid + n_particles],
-            d_particleContainer_->viscosity_forces[pid + 2 * n_particles],
-          };
-
-#ifdef _debug
-          printf("valid neighbor pair (pid, rel) -> (%u, %u)\n", pid, rel);
-          printf("Neighbor Pair: (%u,%u)\n", pid, rel);
-#endif
-          // Find the vector difference of velocity
-          assign(velocity_difference, local_vel);
-          relativeDisplacement(velocity_difference, rel_vel);
-
-          // Find the density and set the new pressure
-
-          d_particleContainer_->densities[pid] += d_particleContainer_->masses[rel] * cubicSpline(distance, h);
-          d_particleContainer_->pressures[pid] = static_cast<float>(k * (d_particleContainer_->densities[pid] - rho0));
-
-          // Calculate the approximate pressure force
-          kernel_val = gradCubicSpline(distance, h);
-          calculatePressureForce(displacement, d_particleContainer_->masses[rel], d_particleContainer_->densities[pid], d_particleContainer_->densities[rel], kernel_val);
-          sum(pid_prfs, displacement);
-
-          // Calculate the approximate viscosity force 
-          kernel_val = laplacianCubicSpline(distance, h);
-          calculateViscosityForce(velocity_difference, d_particleContainer_->masses[rel], kernel_val);
-          sum(pid_visf, velocity_difference);
-
-          for (int i = 0; i < 3; ++i) {
-            d_particleContainer_->pressure_forces[pid + i * n_particles] = pid_prfs[i];
-            d_particleContainer_->viscosity_forces[pid + i * n_particles] = pid_visf[i];
-          }
-        }
-      }
-    }
+  // Set computed force values 
+#pragma unroll
+  for (int i = 0; i < 3; ++i) {
+    d_particleContainer_->pressure_forces[idx + i * n_particles]  = *pressure_force_arr[i];
+    d_particleContainer_->viscosity_forces[idx + i * n_particles] = *viscosity_force_arr[i];
   }
 }
 
-/*
-   Host function to call the search kernel to find each particles forces relative to itself
-   */
+__global__ void setOffset() {
+  global_offset = 0;
+}
+ 
+/**
+ * Host function to call the search kernel to find each particles forces relative to itself
+ */
 __host__ void callToNeighborSearch(
+  float *average_neighbor_count,
   spatialLookupTable *d_lookup_,
   particleContainer *d_particleContainer_,
+  uint32_t *neighbors,
+  uint32_t *neighbor_offset,
   uint32_t n_partitions, 
   uint32_t n_particles,
   uint32_t containerCount[3],
-  const float h 
+  uint32_t list_size,
+  const float h
 ) {
-  uint32_t threadsPerBlock = 256; 
-  uint32_t gridSize = (n_particles * threadsPerBlock - 1) / threadsPerBlock;
+  static uint32_t blocks = 0, threads = 0;
+  setGridSize(&blocks, &threads, n_particles);
+  int status = 0, neighbor_count = 0;
+  cudaError_t err;
 
-  // Call to kernel
-  neighborKernel<<<gridSize, threadsPerBlock>>>(
-    d_lookup_, d_particleContainer_, n_partitions, n_particles, containerCount, h
-  );
-  cudaDeviceSynchronize();
-  cudaError_t err = cudaGetLastError();
+  cudaMemPrefetchAsync(neighbors, list_size * sizeof(uint32_t), 0); 
+  cudaMemPrefetchAsync(neighbors, (n_particles + 1) * sizeof(uint32_t), 0);
+
+  err = cudaGetLastError();
   if (err != cudaSuccess) {
-    std::cerr << "Error: " << cudaGetErrorString(err) << '\n';
+    std::cerr << "Prefetch: " << cudaGetErrorString(err) << '\n';
+    exit(EXIT_FAILURE);
+  }
+
+  // Perform computation until neighbor list is valid sized 
+  do {
+    setOffset<<<1, 1>>>();
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      std::cerr << "Set global offset: " << cudaGetErrorString(err) << '\n';
+      exit(EXIT_FAILURE);
+    }
+
+    computeNeighborList<<<blocks, threads>>>(
+      d_lookup_,
+      d_particleContainer_,
+      neighbors,
+      neighbor_offset,
+      &neighbor_count,
+      n_partitions,
+      n_particles,
+      containerCount,
+      list_size,
+      &status,
+      h
+    );
+    
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      std::cerr << "Neighbor List: " << cudaGetErrorString(err) << '\n';
+      exit(EXIT_FAILURE);
+    }
+
+    // Wait for all threads to complete before restarting if size error
+    cudaDeviceSynchronize();
+    
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      std::cerr << "List sync: " << cudaGetErrorString(err) << '\n';
+      exit(EXIT_FAILURE);
+    }
+    
+    // Neighbors list size error
+    if (status == 1) {
+      // Take truncated value of 3/2 k and resize neighbors list
+      int average_neighbors = list_size / n_particles; 
+      average_neighbors *= 0.5;
+      cudaFree(neighbors);
+      cudaMallocManaged(&neighbors, average_neighbors * n_particles * sizeof(uint32_t));
+    }
+
+  } while (status != 0); 
+
+  // Get average number of neighbors per particle for profiling 
+  (*average_neighbor_count) = static_cast<float>(neighbor_count) / n_particles;
+
+  // Expected success 
+  computeForces<<<blocks, threads>>>(
+    neighbors,
+    neighbor_offset,
+    d_particleContainer_,
+    n_particles,
+    h
+  );
+  
+  err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    std::cerr << "Force Compute: " << cudaGetErrorString(err) << '\n';
+    exit(EXIT_FAILURE);
+  }
+  
+  cudaDeviceSynchronize();
+
+  err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    std::cerr << "Force Sync: " << cudaGetErrorString(err) << '\n';
     exit(EXIT_FAILURE);
   }
 }
@@ -357,33 +441,13 @@ __global__ void firstVerletKernel(particleContainer *d_particleContainer_, uint3
   // Position and velocity update loop
   for (int i = 0; i < 3; ++i) {
     uint32_t co = idx + i * n_particles;
-#ifdef _debug 
-    printf("! before !\nidx: %u\n  pos: <%f,%f,%f>\n  vel: <%f,%f,%f>\n",
-      idx,
-      d_particles_[idx].position[0],
-      d_particles_[idx].position[1],
-      d_particles_[idx].position[2],
-      d_particles_[idx].velocity[0],
-      d_particles_[idx].velocity[1],
-      d_particles_[idx].velocity[2]
-    );
-#endif
+   
     // Sums the pressure and viscosity forces for each axis
     forceSum[i] += (d_particleContainer_->pressure_forces[co] + d_particleContainer_->viscosity_forces[co]);
+    
     // Integrates the velocity and position
     d_particleContainer_->velocities[co] += (forceSum[i] * static_cast<float>(0.5 * dt));
     d_particleContainer_->positions[co] += (d_particleContainer_->velocities[co] * static_cast<float>(dt));
-#ifdef _debug 
-    printf("! after !\nidx: %u\n  pos: <%f,%f,%f>\n  vel: <%f,%f,%f>\n",
-      idx,
-      d_particles_[idx].position[0],
-      d_particles_[idx].position[1],
-      d_particles_[idx].position[2],
-      d_particles_[idx].velocity[0],
-      d_particles_[idx].velocity[1],
-      d_particles_[idx].velocity[2]
-    );
-#endif
   }
 }
 
@@ -392,27 +456,37 @@ __global__ void firstVerletKernel(particleContainer *d_particleContainer_, uint3
    */
 __global__ void secondVerletKernel(particleContainer *d_particleContainer_, uint32_t n_particles) {
   uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
-#ifdef _debug
-  printf("Idx: %u\n", idx);
-#endif
-if (idx >= n_particles) return;
-
-#ifdef _debug
-  printf("Test Print\n");
-  printf("Particle %u : %f\n", idx, d_particles_[idx].pressure_force[0]);
-  printf("Seg fault?\n");
-#endif 
+  if (idx >= n_particles) return;
 
   float forceSum[3] = {0.0, -9.81, 0.0};
+
+  // iterate over axis
   for (int i = 0; i < 3; ++i) {
     uint32_t co = idx + i * n_particles;
-
+    // Sum forces from previous iteration 
     forceSum[i] += ((d_particleContainer_->pressure_forces[co] + d_particleContainer_->viscosity_forces[co]) / d_particleContainer_->masses[idx]);
     
-#ifdef _debug
-  printf("Force Sum %u: %f\n", idx, forceSum[i]); 
-#endif 
-
+    // Second half step to fully velocity
     d_particleContainer_->velocities[co] += (forceSum[i] * static_cast<float>(0.5 * dt));
   }
+}
+
+/*
+  Note: I want to get an idea of an acceptable size for my compressed sparse matrix neighbors list 
+  I will start with a naive O(n^2) spatial complexity but store the average number of neighbors in a static variable
+  At the end of the simulation I will print that value k. I want to make the next arry size 3/2 * k * n_particles and determine if that is acceptable
+  I will add in a check for if an index is oob and call a resizing kernel to add k elements to the array and restart the neighbor search
+*/
+
+__host__ void allocateNeighborArrays(
+  uint32_t **neighbors,
+  uint32_t **neighbor_offset,
+  uint32_t n_particles,
+  uint32_t *list_size
+) {
+  (*list_size) = n_particles * (n_particles - 1);   // Naive O(n^2) memory calculation for now
+
+  // Create memory
+  cudaMallocManaged(neighbors, (*list_size) * sizeof(uint32_t));
+  cudaMallocManaged(neighbor_offset, (n_particles + 1) * sizeof(uint32_t));
 }

@@ -1,9 +1,10 @@
 #include "fluids.hpp"
+#include "integrate.hpp"
 
 #define alpha 1.5
 #define rho0 1
 
-// #define _debug
+#define _debug
 //#define _step
 
 glm::vec3 densityColor(float density, float target_density);
@@ -64,6 +65,14 @@ int main(int argc, char *argv[])
   float *u_positions = nullptr;
   float *u_densities = nullptr;
 
+  uint32_t *neighbors = nullptr;
+  uint32_t *neighbor_offset = nullptr;
+  uint32_t list_size = 0;
+  float average_neighbor_count = 0.0;
+
+  initOffsetTable();
+  allocateNeighborArrays(&neighbors, &neighbor_offset, particle_count, &list_size);
+
   // Call to initialization
   initalizeSimulation(
     &d_lookup_,
@@ -94,8 +103,12 @@ int main(int argc, char *argv[])
 
     // Update Position State
     particleIterator(
+      &average_neighbor_count,
       d_lookup_,
       d_particleContainer_,
+      neighbors,
+      neighbor_offset,
+      list_size,
       &u_positions,
       &u_densities,
       container,
@@ -104,9 +117,10 @@ int main(int argc, char *argv[])
       h
     );
 
+    std::cout << "Iterated over particles\n";
+
     // Polls for events in SDL instance
-    int iter = 0;
-    while (SDL_PollEvent(&event) && iter < 60000) {
+    while (SDL_PollEvent(&event)) {
       // Quit program out
       if (event.type == SDL_QUIT) {
         exit(0);
@@ -181,9 +195,11 @@ int main(int argc, char *argv[])
     context_.shader_->Render(fov, aspect_ratio, near_plane, far_plane, cube_gl.object_color_, cube_model);
     cube_gl.DrawCube();
 
-    // std::cout << "Cube Draw Call" << std::endl;
+    std::cout << "Cube Draw Call" << std::endl;
 
     for (int idx = 0; idx < particle_count; ++idx) {
+      std::cout << "Test: " << u_positions[idx * 3];
+
       position = glm::vec3(
         u_positions[idx * 3],
         u_positions[idx * 3 + 1],
@@ -201,18 +217,18 @@ int main(int argc, char *argv[])
       sphere_gl.DrawSphere();
     }
 
-    // std::cout << "Sphere Draw Call" << std::endl;
+    std::cout << "Sphere Draw Call" << std::endl;
 
     // Swap buffers
     SDL_GL_SwapWindow(context_.window_);
-
-    iter++;
   }
 
   // Free gpu memory
   delete (d_particleContainer_);
   cudaFree(u_positions);
   cudaFree(d_lookup_);
+
+  std::cout << "Average Neighbor Count Was: " << average_neighbor_count << '\n';
 
   return 0;
 }

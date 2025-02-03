@@ -1,12 +1,7 @@
 #include "boundary.hpp"
 #include "spatial.hpp"
-#include <cstdint>
-#include <cstdlib>
-#include <cuda_device_runtime_api.h>
-#include <driver_types.h>
 
 #define tol 1e-4
-// #define _debug
 
 __host__ static inline bool equal(std::vector<float> new_container, std::vector<float> boundary) {
   for (int i = 0; i < 3; ++i) {
@@ -118,40 +113,29 @@ __host__ void updateBounds(spatialLookupTable *d_lookup_, particleContainer *d_p
 /*
    Kernel call to naively, individually rectify potential out of bounds behavior for a particle 
    */
-__global__ static void boundaryKernel(const struct Container boundary, particleContainer *d_particleContainer_, uint32_t n_particles, int32_t n_partitions, const float absRadius) {
+__global__ static void boundaryKernel(const struct Container boundary, particleContainer *d_particleContainer_, uint32_t n_particles, int32_t n_partitions, const float abs_radius) {
 uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
   if (idx >= n_particles) return;
-
   const float restitution = 0.8;
   
   // Overlap values
   float upperDistance[3], lowerDistance[3];
-#ifdef _debug
-  printf("Idx: %u\n", idx);
-#endif
+  
   for (int i = 0; i < 3; ++i) {
-
     uint32_t co = idx + i * n_particles;
-    // Find potential overlap values
-#ifdef _debug
-    printf("mass: %f\n", d_particles_[0].mass);
-#endif
-    upperDistance[i] = boundary.upper[i] - d_particleContainer_->positions[co] - absRadius;
-    lowerDistance[i] = d_particleContainer_->positions[co] + absRadius - boundary.lower[i];
-#ifdef _debug  
-    printf("Upper: %f\n", upperDistance[i]);
-    printf("Lower: %f\n", lowerDistance[i]);
-#endif 
+
+    upperDistance[i] = boundary.upper[i] - d_particleContainer_->positions[co] - abs_radius;
+    lowerDistance[i] = d_particleContainer_->positions[co] + abs_radius - boundary.lower[i];
+
     // Rectify overlap 
-    if (upperDistance[i] < absRadius + tol) {
+    if (upperDistance[i] < abs_radius + tol) {
+      // Adjust for upper bounds overlap
       d_particleContainer_->velocities[co] *= -restitution;
       d_particleContainer_->positions[co] -= upperDistance[i];
-
-    } else if (lowerDistance[i] < absRadius + tol) {
-
+    } else if (lowerDistance[i] < abs_radius + tol) {
+      // Adjust for lower bounds overlap
       d_particleContainer_->velocities[co] *= -restitution; 
       d_particleContainer_->positions[co] += lowerDistance[i];
-
     }
   }
 }
@@ -161,26 +145,17 @@ uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
    Sets the range of acceptable thread idx to act on particles 
    */
 __host__ void callToBoundaryConditions(struct Container boundary, particleContainer *d_particleContainer_, uint32_t n_particles, uint32_t n_partitions, const float h) {
-  uint32_t threadsPerBlock = 256; 
-  uint32_t gridSize = (n_particles + threadsPerBlock - 1) / threadsPerBlock; 
-#ifdef _debug          
-  std::cout << "Test Mass: " << d_particles_[0].mass << '\n'; // This should work since it hasn't been migrated to the cpu yet
-#endif
-  // Iterate over each container and call kernel for each one 
-  boundaryKernel<<<gridSize, threadsPerBlock>>>(
-    boundary, d_particleContainer_, n_particles, n_partitions, h * 0.2
-  );    // First time d_particles_ is called by device -> Must be migrated to device
-  cudaError_t launchErr = cudaGetLastError();
-  if (launchErr != cudaSuccess) {
-    std::cerr << "Bound Launch Error: " << cudaGetErrorString(launchErr) << '\n';
-    exit(EXIT_FAILURE);
-  }   // Issue isn't a launch error (?) I don't know how that delineates 
 
+  static uint32_t blocks = 0, threads = 0;
+  setGridSize(&blocks, &threads, n_particles);
+
+  // Iterate over each container and call kernel for each one 
+  boundaryKernel<<<blocks, threads>>>(
+    boundary,
+    d_particleContainer_,
+    n_particles,
+    n_partitions,
+    h * 0.2   // Absolute radius
+  );    // First time d_particles_ is called by device -> Must be migrated to device
   cudaDeviceSynchronize();
-  
-  cudaError_t boundErr = cudaGetLastError();
-  if (boundErr != cudaSuccess) {
-    std::cerr << "Bound Error: " << cudaGetErrorString(boundErr) << '\n';
-    exit(EXIT_FAILURE);
-  }
 }

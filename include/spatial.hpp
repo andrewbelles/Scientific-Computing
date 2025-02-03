@@ -176,6 +176,8 @@ class particleContainer {
 
 /* Function prototypes */
 
+__host__ void setGridSize(uint32_t *blocks, uint32_t *threads, uint32_t arr_size);
+
 template <typename T>
 T min(const std::vector<T>& vec);
 
@@ -185,8 +187,8 @@ T max(const std::vector<T>& vec);
 template <typename T>
 T findSquare(T value);
 
-__device__ void positionToCellCoord(uint32_t cell_coord[3], const float position[3], const float h);
-__device__ uint32_t hashPosition(const uint32_t cell_coord[3], uint32_t n_partition);
+__device__ int3 positionToCellCoord(float3 position, const float h);
+__device__ uint32_t hashPosition(int3 cell_coord, uint32_t n_partition);
 
 __host__ void bitonicSort(spatialLookupTable *d_lookup_, uint32_t paddedSize);
 

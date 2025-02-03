@@ -1,8 +1,8 @@
 CC = gcc
 CXX = g++
 CCU = nvcc
-CFLAGS = -g -pg -Wall -Iinclude/ 
-CXXFLAGS = -std=c++17 -pg -Wall -Iinclude/
+CFLAGS = -g -O3 -pg -Wall -Iinclude/ 
+CXXFLAGS = -O3 -std=c++17 -pg -Wall -Iinclude/
 CUFLAGS = -std=c++17 -pg -lineinfo -Iinclude/ -Xcompiler -Wall -rdc=true
 LDFLAGS = -lGLEW -lGL -lGLU -lSDL2
 CUDA_LDFLAGS = -lcudart -lcudadevrt 
@@ -11,7 +11,9 @@ EXEC = fluidsim
 C_SRC = $(wildcard src/*.c)
 CU_SRC = $(wildcard src/cuda/*.cu)
 CXX_SRC = $(wildcard src/*.cpp)
-OBJ = $(C_SRC:src/%.c=bin/%.o) $(CXX_SRC:src/%.cpp=bin/%.o) $(CU_SRC:src/cuda/%.cu=bin/%.o)
+ASM_SRC = $(wildcard src/*.asm)
+OBJ = $(C_SRC:src/%.c=bin/%.o) $(CXX_SRC:src/%.cpp=bin/%.o) $(CU_SRC:src/cuda/%.cu=bin/%.o) 
+#$(ASM_SRC:src/%.asm=bin/%.o)
 
 ARGS = 5000 25
 
@@ -28,6 +30,9 @@ bin/%.o: src/%.cpp
 
 bin/%.o: src/cuda/%.cu
 	$(CCU) $(CUFLAGS) -c $< -o $@
+
+#bin/%.o: src/%.asm
+#	nasm -f elf64 $< -o $@
 
 profile_cpu: $(EXEC)
 	@echo "Profiling CPU"
