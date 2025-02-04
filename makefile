@@ -3,7 +3,7 @@ CXX = g++
 CCU = nvcc
 CFLAGS = -g -O3 -pg -Wall -Iinclude/ 
 CXXFLAGS = -O3 -std=c++17 -pg -Wall -Iinclude/
-CUFLAGS = -std=c++17 -pg -lineinfo -Iinclude/ -Xcompiler -Wall -rdc=true
+CUFLAGS = -std=c++17 -pg -lineinfo -Iinclude/ -Xcompiler -Wall -rdc=true 
 LDFLAGS = -lGLEW -lGL -lGLU -lSDL2
 CUDA_LDFLAGS = -lcudart -lcudadevrt 
 

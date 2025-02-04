@@ -14,7 +14,7 @@ __host__ static inline bool equal(std::vector<float> new_container, std::vector<
    Updates the bounds given a new container vector. This stalls the program until
    it can accurately update the spatial hashmap for a new size. 
    */
-__host__ void updateBounds(spatialLookupTable *d_lookup_, particleContainer *d_particleContainer_, std::vector<float> new_container, uint32_t particle_recount, const float h) {
+__host__ void updateBounds(Lookup *d_lookup_, particleContainer *d_objs_, std::vector<float> new_container, uint32_t particle_recount, const float h) {
   // refac cuda mem manage now pass cpu resize 
   static std::vector<float> boundary; 
   static uint32_t n_particles  = 0;
@@ -67,14 +67,14 @@ __host__ void updateBounds(spatialLookupTable *d_lookup_, particleContainer *d_p
     // Set copy size
     uint32_t copy = (n_particles < particle_recount) ? n_particles : particle_recount;
 
-    cudaMemcpy(n_pos, d_particleContainer_->positions, copy * 3 * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(n_vel, d_particleContainer_->velocities, copy * 3 * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(n_pos, d_objs_->positions, copy * 3 * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(n_vel, d_objs_->velocities, copy * 3 * sizeof(float), cudaMemcpyDeviceToHost);
 
-    delete (d_particleContainer_);
+    delete (d_objs_);
 
     float *n_prf, *n_visf, *n_mass, *n_dens, *n_pr;
 
-    new (d_particleContainer_) particleContainer();
+    new (d_objs_) particleContainer();
 
     // Allocate accumulators
     cudaMallocManaged(&n_prf, particle_recount * 3 * sizeof(float));
@@ -85,7 +85,7 @@ __host__ void updateBounds(spatialLookupTable *d_lookup_, particleContainer *d_p
 
     // Add new particles if size is larger
     if (particle_recount > n_particles) {
-      d_particleContainer_->addNewParticles(
+      d_objs_->addNewParticles(
         n_pos,
         n_vel,
         n_particles, 
@@ -95,7 +95,7 @@ __host__ void updateBounds(spatialLookupTable *d_lookup_, particleContainer *d_p
       );
     }
 
-    d_particleContainer_->slowSetAccumulators(
+    d_objs_->slowSetAccumulators(
       n_prf,
       n_visf,
       n_mass,
@@ -113,7 +113,7 @@ __host__ void updateBounds(spatialLookupTable *d_lookup_, particleContainer *d_p
 /*
    Kernel call to naively, individually rectify potential out of bounds behavior for a particle 
    */
-__global__ static void boundaryKernel(const struct Container boundary, particleContainer *d_particleContainer_, uint32_t n_particles, int32_t n_partitions, const float abs_radius) {
+__global__ static void boundaryKernel(const struct Container boundary, particleContainer *d_objs_, uint32_t n_particles, int32_t n_partitions, const float abs_radius) {
 uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
   if (idx >= n_particles) return;
   const float restitution = 0.8;
@@ -124,18 +124,18 @@ uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
   for (int i = 0; i < 3; ++i) {
     uint32_t co = idx + i * n_particles;
 
-    upperDistance[i] = boundary.upper[i] - d_particleContainer_->positions[co] - abs_radius;
-    lowerDistance[i] = d_particleContainer_->positions[co] + abs_radius - boundary.lower[i];
+    upperDistance[i] = boundary.upper[i] - d_objs_->positions[co] - abs_radius;
+    lowerDistance[i] = d_objs_->positions[co] + abs_radius - boundary.lower[i];
 
     // Rectify overlap 
     if (upperDistance[i] < abs_radius + tol) {
       // Adjust for upper bounds overlap
-      d_particleContainer_->velocities[co] *= -restitution;
-      d_particleContainer_->positions[co] -= upperDistance[i];
+      d_objs_->velocities[co] *= -restitution;
+      d_objs_->positions[co] -= upperDistance[i];
     } else if (lowerDistance[i] < abs_radius + tol) {
       // Adjust for lower bounds overlap
-      d_particleContainer_->velocities[co] *= -restitution; 
-      d_particleContainer_->positions[co] += lowerDistance[i];
+      d_objs_->velocities[co] *= -restitution; 
+      d_objs_->positions[co] += lowerDistance[i];
     }
   }
 }
@@ -144,7 +144,7 @@ uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
    Host call to handle the call to boundaryKernel 
    Sets the range of acceptable thread idx to act on particles 
    */
-__host__ void callToBoundaryConditions(struct Container boundary, particleContainer *d_particleContainer_, uint32_t n_particles, uint32_t n_partitions, const float h) {
+__host__ void callToBoundaryConditions(struct Container boundary, particleContainer *d_objs_, uint32_t n_particles, uint32_t n_partitions, const float h) {
 
   static uint32_t blocks = 0, threads = 0;
   setGridSize(&blocks, &threads, n_particles);
@@ -152,7 +152,7 @@ __host__ void callToBoundaryConditions(struct Container boundary, particleContai
   // Iterate over each container and call kernel for each one 
   boundaryKernel<<<blocks, threads>>>(
     boundary,
-    d_particleContainer_,
+    d_objs_,
     n_particles,
     n_partitions,
     h * 0.2   // Absolute radius

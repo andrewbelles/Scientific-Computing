@@ -4,7 +4,7 @@
 #define alpha 1.5
 #define rho0 1
 
-#define _debug
+// #define __debug
 //#define _step
 
 glm::vec3 densityColor(float density, float target_density);
@@ -59,30 +59,30 @@ int main(int argc, char *argv[])
 
   // Initialize the simulation
   uint32_t partition_count = 0;
-  spatialLookupTable *d_lookup_ = nullptr;
-  particleContainer *d_particleContainer_ = nullptr;
+  Lookup *d_lookup_ = nullptr;
+  particleContainer *d_objs_ = nullptr;
+
   // Unified positions
   float *u_positions = nullptr;
   float *u_densities = nullptr;
 
-  uint32_t *neighbors = nullptr;
-  uint32_t *neighbor_offset = nullptr;
-  uint32_t list_size = 0;
-  float average_neighbor_count = 0.0;
+  uint32_t list_size;
 
   initOffsetTable();
-  allocateNeighborArrays(&neighbors, &neighbor_offset, particle_count, &list_size);
+
+  neighborList *list;
+  list = initNeighborList(&list_size, particle_count);
 
   // Call to initialization
   initalizeSimulation(
     &d_lookup_,
-    &d_particleContainer_,
+    &d_objs_,
     container,
     &partition_count,
     particle_count,
     h
   ); 
-#ifdef _debug 
+#ifdef __debug 
   std::cout << "Simulation Initialized\n";
 #endif
 
@@ -103,22 +103,21 @@ int main(int argc, char *argv[])
 
     // Update Position State
     particleIterator(
-      &average_neighbor_count,
-      d_lookup_,
-      d_particleContainer_,
-      neighbors,
-      neighbor_offset,
-      list_size,
+      list,
+      d_objs_,
+      &list_size,
       &u_positions,
       &u_densities,
+      d_lookup_,
       container,
       particle_count,
       partition_count,
       h
     );
 
+#ifdef __debug
     std::cout << "Iterated over particles\n";
-
+#endif
     // Polls for events in SDL instance
     while (SDL_PollEvent(&event)) {
       // Quit program out
@@ -194,11 +193,11 @@ int main(int argc, char *argv[])
 
     context_.shader_->Render(fov, aspect_ratio, near_plane, far_plane, cube_gl.object_color_, cube_model);
     cube_gl.DrawCube();
-
+#ifdef __debug
     std::cout << "Cube Draw Call" << std::endl;
-
+#endif
     for (int idx = 0; idx < particle_count; ++idx) {
-      std::cout << "Test: " << u_positions[idx * 3];
+      //std::cout << "Test: " << u_positions[idx * 3];
 
       position = glm::vec3(
         u_positions[idx * 3],
@@ -216,20 +215,20 @@ int main(int argc, char *argv[])
       context_.shader_->Render(fov, aspect_ratio, near_plane, far_plane, sphere_gl.object_color_, sphere_model);
       sphere_gl.DrawSphere();
     }
-
+#ifdef __debug
     std::cout << "Sphere Draw Call" << std::endl;
-
+#endif
     // Swap buffers
     SDL_GL_SwapWindow(context_.window_);
   }
 
   // Free gpu memory
-  delete (d_particleContainer_);
+  delete (d_objs_);
   cudaFree(u_positions);
   cudaFree(d_lookup_);
-
+#ifdef __debug
   std::cout << "Average Neighbor Count Was: " << average_neighbor_count << '\n';
-
+#endif
   return 0;
 }
 // End of main

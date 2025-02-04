@@ -26,7 +26,7 @@ struct tableEntry {
 /**
  * Spatial Lookup Table with paired start and end cell arrays
  */
-struct spatialLookupTable {
+struct Lookup {
   struct tableEntry *table_;
   uint32_t *start_cell;
   uint32_t *end_cell;
@@ -190,10 +190,10 @@ T findSquare(T value);
 __device__ int3 positionToCellCoord(float3 position, const float h);
 __device__ uint32_t hashPosition(int3 cell_coord, uint32_t n_partition);
 
-__host__ void bitonicSort(spatialLookupTable *d_lookup_, uint32_t paddedSize);
+__host__ void bitonicSort(Lookup *d_lookup_, uint32_t paddedSize);
 
 __host__ void hostFillTable(
-  spatialLookupTable *d_lookup_,
+  Lookup *d_lookup_,
   particleContainer *d_particleContainer_,
   uint32_t n_partitions,
   uint32_t n_particles,
@@ -202,7 +202,7 @@ __host__ void hostFillTable(
 );
 
 __host__ void initalizeSimulation(
-  spatialLookupTable **d_lookup_,
+  Lookup **d_lookup_,
   particleContainer **d_particleContainer_,
   const std::vector<float> container,
   uint32_t *n_partitions,

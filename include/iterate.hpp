@@ -5,18 +5,21 @@
 #include "boundary.hpp"
 #include "integrate.hpp"
 
+#include <cstdlib>
+#include <cuda_device_runtime_api.h>
+#include <cuda_runtime_api.h>
+#include <driver_types.h>
+
 __host__ void particleIterator(
-  float *average_neighbor_count,
-  spatialLookupTable *d_lookup_,
-  particleContainer *d_particleContainer_,
-  uint32_t *neighbors,
-  uint32_t *neighbor_offset,
-  uint32_t list_size,
+  neighborList *list,
+  particleContainer *d_objs_,
+  uint32_t *list_size,
   float **u_positions,
   float **u_densities,
-  std::vector<float> container,
-  uint32_t n_particles,
-  uint32_t n_partitions, 
+  Lookup *d_lookup_,
+  const std::vector<float> container,
+  const uint32_t n_particles,
+  const uint32_t n_partitions, 
   const float h
 );
 

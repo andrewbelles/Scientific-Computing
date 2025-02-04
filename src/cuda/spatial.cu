@@ -26,9 +26,11 @@ __host__ inline void setGridSize(uint32_t *blocks, uint32_t *threads, uint32_t a
        : ((arr_size + expected_threads - 1) / expected_threads) 
     : (*blocks);
   (*threads) = ((*threads) == 0) ? findSquare((arr_size - 1) / ((*blocks) - 1)) : (*threads);
-
+#ifdef __debug
   std::cout << "Set grid sizes to: (" << (*blocks) << " x " << (*threads) << ")\n";
+#endif
 }
+
 /**
  * Simple templated function to return the minimum of any Vector
  */
@@ -106,11 +108,12 @@ __device__ int3 positionToCellCoord(float3 position, const float h) {
  * Hashes a particles cell coordinate to a hash index
  */
 __device__ uint32_t hashPosition(int3 cell_coord, uint32_t n_partitions) {
-  const uint32_t primes[] = {73856093, 19349663, 83492791};   // Local hash primes array
+  const uint64_t primes[] = {73856093, 19349663, 83492791};   // Local hash primes array
   const int *cell[]       = {&cell_coord.x, &cell_coord.y, &cell_coord.z};
   uint32_t hash = 0;
 
   // Distribute from prime values
+  // Promote int32_t to 64_t by multiplying by uint64_t
   for (int i = 0; i < 3; ++i) {
     hash += *cell[i] * primes[i];
   }
@@ -121,7 +124,7 @@ __device__ uint32_t hashPosition(int3 cell_coord, uint32_t n_partitions) {
 /**
  * Kernel to quickly fill all values in start and end cell arrays to sentinel values
  */
-__global__ static void fillSentinelKernel(spatialLookupTable *d_lookup_, uint32_t n_partitions) { 
+__global__ static void fillSentinelKernel(Lookup *d_lookup_, uint32_t n_partitions) { 
   uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
   if (idx >= n_partitions) return;
 
@@ -133,7 +136,7 @@ __global__ static void fillSentinelKernel(spatialLookupTable *d_lookup_, uint32_
  * Kernel to quickly insert all particle positions into the lookup hashmap unordered
  */
 __global__ static void insertTableKernel(
-    spatialLookupTable *d_lookup_,
+    Lookup *d_lookup_,
     particleContainer *d_particleContainer_,
     uint32_t n_particles,
     uint32_t n_partitions,
@@ -167,7 +170,7 @@ __global__ static void insertTableKernel(
  * Kernel Function to sort lookup table by cell_key value. 
  * Credit to github user rgba for the relative structure of pair selectioon
  */
-__global__ static void sortPairs(spatialLookupTable *d_lookup_, int j, int i, uint32_t paddedSize) {
+__global__ static void sortPairs(Lookup *d_lookup_, int j, int i, uint32_t paddedSize) {
   uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
   uint32_t idxj = idx ^ j;
   if (idx >= paddedSize) return;
@@ -195,7 +198,7 @@ __global__ static void sortPairs(spatialLookupTable *d_lookup_, int j, int i, ui
  * Sorts array of struct tableEntry by their cell cell_key. 
  * Optimized for parallelization on GPU
  */
-__host__ void bitonicSort(spatialLookupTable *d_lookup_, uint32_t padded_size) {
+__host__ void bitonicSort(Lookup *d_lookup_, uint32_t padded_size) {
   // Determine the number of threads dynamically to ensure SM workload maximized
   static uint32_t threads = 0;
   static uint32_t blocks = 0;
@@ -214,7 +217,7 @@ __host__ void bitonicSort(spatialLookupTable *d_lookup_, uint32_t padded_size) {
 /**
  * Create the start and end cell based on filled lookup tableEntry
  */
-__global__ static void setTableIndexes(spatialLookupTable *d_lookup_, uint32_t n_partitions, uint32_t n_particles) {
+__global__ static void setTableIndexes(Lookup *d_lookup_, uint32_t n_partitions, uint32_t n_particles) {
   uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x + 1; // Idx: omit 0
   if (idx >= n_particles) return;
   
@@ -238,7 +241,7 @@ __global__ static void setTableIndexes(spatialLookupTable *d_lookup_, uint32_t n
 /**
  * Host function to call individual kernels to set values of table 
  */
-__host__ void hostFillTable(spatialLookupTable *d_lookup_, particleContainer *d_particleContainer_, uint32_t n_partitions, uint32_t n_particles, uint32_t padded_size, const float h) {
+__host__ void hostFillTable(Lookup *d_lookup_, particleContainer *d_particleContainer_, uint32_t n_partitions, uint32_t n_particles, uint32_t padded_size, const float h) {
   // Might not be optimal as there are a maximum number of threads and is inflexible
   static uint32_t insert_threads = 0, table_threads = 0;
   static uint32_t insert_blocks = 0, table_blocks = 0;
@@ -271,7 +274,7 @@ __host__ void hostFillTable(spatialLookupTable *d_lookup_, particleContainer *d_
  * Essentially a constructor for the simulation
  */
 __host__ void initalizeSimulation(
-  spatialLookupTable **d_lookup_,
+  Lookup **d_lookup_,
   particleContainer **d_particleContainer_,
   const std::vector<float> container,
   uint32_t *n_partitions,
@@ -297,14 +300,14 @@ __host__ void initalizeSimulation(
   uint32_t paddedSize = findSquare(n_particles); 
   
   // Initialize lookup table in device memory
-  spatialLookupTable lookup_, host_lookup_;
+  Lookup lookup_, host_lookup_;
 
   // Malloc Memory on the device for lookup members
   cudaMalloc(&lookup_.table_, paddedSize * sizeof(tableEntry));
   cudaMalloc(&lookup_.start_cell, (*n_partitions) * sizeof(uint32_t));
   cudaMalloc(&lookup_.end_cell, (*n_partitions) * sizeof(uint32_t));
   // Malloc Memory for ptr to device lookup
-  cudaMalloc(d_lookup_, sizeof(spatialLookupTable));
+  cudaMalloc(d_lookup_, sizeof(Lookup));
 
   // Set device ptrs in host
   host_lookup_.table_     = lookup_.table_;
@@ -315,7 +318,7 @@ __host__ void initalizeSimulation(
   cudaMemcpy(
     (*d_lookup_),
     &host_lookup_,
-    sizeof(spatialLookupTable),
+    sizeof(Lookup),
     cudaMemcpyHostToDevice
   );
 
