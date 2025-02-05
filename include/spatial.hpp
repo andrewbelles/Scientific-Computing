@@ -14,6 +14,7 @@
 #include <cstdint>
 
 #define tol 1e-5
+#define scale_factor 0.2
 
 /**
  * Single entry into key/id paired table
@@ -49,6 +50,7 @@ class particleContainer {
   float *velocities;
   float *pressure_forces;
   float *viscosity_forces; // 3D flattened to 1D of size n_particles * 3
+  float *repulsive_forces; 
   float *masses;
   float *densities;
   float *pressures; // Flat arrays of size n_particles
@@ -59,6 +61,7 @@ class particleContainer {
     velocities       = nullptr;
     pressure_forces  = nullptr;
     viscosity_forces = nullptr;
+    repulsive_forces = nullptr;
     masses           = nullptr;
     densities        = nullptr;
     pressures        = nullptr;
@@ -71,6 +74,7 @@ class particleContainer {
     float *u_vel, 
     float *u_prf,
     float *u_visf,
+    float *u_repf,
     float *u_mass,
     float *u_dens,
     float *u_pr,  // Unified ptrs to be set in value
@@ -92,10 +96,11 @@ class particleContainer {
           u_vel[idx]  = vel_dis(gen);
           u_prf[idx]  = 0.0;
           u_visf[idx] = 0.0;
+          u_repf[idx] = 0.0;
       }
 
       // Handle 1D vectors
-      u_mass[i] = 0.954;
+      u_mass[i] = 0.488 * scale_factor * scale_factor * scale_factor;
       u_dens[i] = tol;
       u_pr[i]   = 0.0;
     }
@@ -105,6 +110,7 @@ class particleContainer {
     velocities       = u_vel;
     pressure_forces  = u_prf;
     viscosity_forces = u_visf;
+    repulsive_forces = u_repf;
     masses           = u_mass;
     densities        = u_dens;
     pressures        = u_pr;
@@ -133,6 +139,7 @@ class particleContainer {
   void slowSetAccumulators(
     float *u_prf,
     float *u_visf,
+    float *u_repf,
     float *u_mass,
     float *u_dens,
     float *u_pr,
@@ -144,6 +151,7 @@ class particleContainer {
         uint32_t idx = j * n_particles + i;
         u_prf[idx]  = 0.0;
         u_visf[idx] = 0.0;
+        u_repf[idx] = 0.0;
       }
 
       u_mass[i] = tol;
@@ -165,6 +173,7 @@ class particleContainer {
     cudaFree(velocities);
     cudaFree(pressure_forces);
     cudaFree(viscosity_forces);
+    cudaFree(repulsive_forces);
     cudaFree(masses);
     cudaFree(densities);
     cudaFree(pressures);
@@ -181,8 +190,7 @@ __host__ void setGridSize(uint32_t *blocks, uint32_t *threads, uint32_t arr_size
 template <typename T>
 bool isPrime(T val);
 
-template <typename T>
-void convertToPrime(T *val);
+uint32_t convertToPrime(uint32_t val);
 
 template <typename T>
 T min(const std::vector<T>& vec);
@@ -193,8 +201,8 @@ T max(const std::vector<T>& vec);
 template <typename T>
 T findSquare(T value);
 
-__device__ int3 positionToCellCoord(float3 position, const float h);
-__device__ uint32_t hashPosition(int3 cell_coord, uint32_t n_partition);
+__host__ __device__ int3 positionToCellCoord(float3 position, const float h);
+__host__ __device__ uint32_t hashPosition(int3 cell_coord, uint32_t n_partition);
 
 __host__ void bitonicSort(Lookup *d_lookup_, uint32_t paddedSize);
 

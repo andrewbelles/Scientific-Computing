@@ -18,7 +18,8 @@ __host__ void particleIterator(
   const std::vector<float> container,
   const uint32_t n_particles,
   const uint32_t n_partitions, 
-  const float h
+  const float h,
+  bool first 
 );
 
 #endif // __ITERATE_HPP__

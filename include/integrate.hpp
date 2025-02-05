@@ -22,7 +22,8 @@ __host__ void neighborSearch(
   uint32_t n_partitions,
   uint32_t n_particles,
   uint32_t containerCount[3],
-  float h
+  float h,
+  bool first 
 );
 
 /* Verlet integration passes */

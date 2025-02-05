@@ -2,7 +2,7 @@
 #include "integrate.hpp"
 
 #define alpha 1.5
-#define rho0 1
+#define rho0 1000
 
 // #define __debug
 //#define _step
@@ -51,9 +51,10 @@ int main(int argc, char *argv[])
   std::vector<float> container(3, cube_size);
 
   h = 1.2 * (pow(static_cast<float>(container[0] * container[1] * container[2] / particle_count), 1.0/3.0));
+  h *= scale_factor;  
   std::cout << "Smoothing Radius: " << h << '\n';
 
-  radius = 0.1 * h;
+  radius = h;
   mesh::Sphere_GL sphere_gl(40, 40, radius);
   mesh::Cube_GL cube_gl(cube_size);
 
@@ -82,6 +83,8 @@ int main(int argc, char *argv[])
 #endif
 
   // Update loop
+  int iter = 0;
+  bool first = true;
   while (true) {
     // Clear color
     glClearColor(0.0, 0.0, 0.0, 1.0);
@@ -95,6 +98,12 @@ int main(int argc, char *argv[])
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     
     // std::cout << "Pre-Iterator" << std::endl;
+    if (iter == 0) {
+      first = true;
+      iter++;
+    } else {
+      first = false;
+    }
 
     // Update Position State
     particleIterator(
@@ -105,7 +114,8 @@ int main(int argc, char *argv[])
       container,
       particle_count,
       partition_count,
-      h
+      h,
+      first
     );
 
 #ifdef __debug
@@ -219,9 +229,7 @@ int main(int argc, char *argv[])
   delete (d_objs_);
   cudaFree(u_positions);
   cudaFree(d_lookup_);
-#ifdef __debug
-  std::cout << "Average Neighbor Count Was: " << average_neighbor_count << '\n';
-#endif
+  
   return 0;
 }
 // End of main

@@ -1,7 +1,8 @@
+#include "boundary.hpp"
 #include "iterate.hpp"
 #include "integrate.hpp"
 
-#define tol 1e-4
+//#define __debug
 
 __global__ static void setAccumulators(particleContainer *d_objs_, uint32_t n_particles) {
   uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
@@ -46,7 +47,8 @@ __host__ void particleIterator(
   std::vector<float> container,
   uint32_t n_particles,
   uint32_t n_partitions, 
-  float h
+  float h,
+  bool first
 ) {
   static uint32_t blocks = 0, threads = 0;
   cudaError_t err;
@@ -78,7 +80,7 @@ __host__ void particleIterator(
   // Checking boundary conditions is breaking the particles positions...
   
   // Only one static boundary for now (the container itself)
-  callToBoundaryConditions(boundary, d_objs_, n_particles, n_partitions, h);
+  callToBoundaryConditions(boundary, d_objs_, n_particles, h);
 #ifdef __debug 
   std::cout << "Enforced Boundary\n";
 #endif
@@ -96,6 +98,15 @@ __host__ void particleIterator(
       containerCount[i] = static_cast<uint32_t>(floor(container[i] / (2.0 * h)));
     }
   };
+#ifdef __debug
+  std::cout << "Recall of boundary conditions\n";
+#endif
+
+  // Recall boundary conditions after first integration to ensure boundaries remain upheld
+  //callToBoundaryConditions(boundary, d_objs_, n_particles, h);
+#ifdef __debug
+  std::cout << "Neighbor Search\n";
+#endif
 
   // Calls the neighbor search
   neighborSearch(
@@ -104,7 +115,8 @@ __host__ void particleIterator(
     n_partitions,
     n_particles,
     containerCount,
-    h
+    h,
+    first
   );
 
   // Second verlet pass with new force values

@@ -49,11 +49,11 @@ bool isPrime(T val) {
 /*
  * Increments value till its prime : Inefficient I know
  */
-template <typename T>
-void convertToPrime(T *val) {
-  while (!isPrime(*val)) {
-    (*val)++;
+uint32_t convertToPrime(uint32_t val) {
+  while (!isPrime(val)) {
+    val++;
   }
+  return val;
 }
 
 /**
@@ -117,7 +117,7 @@ T findSquare(T value) {
 /**
  * Creates the cell coordinate from the relative position of a particle's position 
  */
-__device__ int3 positionToCellCoord(float3 position, const float h) {
+__host__ __device__ int3 positionToCellCoord(float3 position, const float h) {
   int3 cell_coord;
 
   cell_coord.x = floorf(position.x / (2.0 * h));
@@ -130,16 +130,14 @@ __device__ int3 positionToCellCoord(float3 position, const float h) {
 /**
  * Hashes a particles cell coordinate to a hash index
  */
-__device__ uint32_t hashPosition(int3 cell_coord, uint32_t n_partitions) {
+__host__ __device__ uint32_t hashPosition(int3 cell_coord, uint32_t n_partitions) {
   const uint64_t primes[] = {73856093, 19349663, 83492791};   // Local hash primes array
   uint32_t hash = 0;
 
   // Distribute from prime values
   // Promote int32_t to 64_t by multiplying by uint64_t
-  hash = cell_coord.x * primes[0];
-  hash += cell_coord.y * primes[1];
-  hash += cell_coord.z * primes[2]
-  ;
+  hash = (cell_coord.x * primes[0]) + (cell_coord.y * primes[1]) + (cell_coord.z * primes[2]);
+
   // Return hash fit into partition size
   return hash % n_partitions;
 }
@@ -249,7 +247,7 @@ __global__ static void setTableIndexes(Lookup *d_lookup_, uint32_t n_partitions,
     d_lookup_->end_cell[d_lookup_->table_[n_particles - 1].cell_key] = n_particles;
     d_lookup_->start_cell[d_lookup_->table_[0].cell_key]             = 0; 
   }
- 
+
   // Pull keys from current idx 
   uint32_t curr_key = d_lookup_->table_[idx].cell_key;
   uint32_t prev_key = d_lookup_->table_[idx - 1].cell_key;
@@ -261,20 +259,6 @@ __global__ static void setTableIndexes(Lookup *d_lookup_, uint32_t n_partitions,
   }
 }
 
-__global__ static void printTable(Lookup *d_lookup_, uint32_t n_partitions, uint32_t n_particles) {
-  for (uint32_t i = 0; i < n_particles; ++i) {
-    printf("TABLE %u\n", i);
-    printf("  IDX:  %u\n", d_lookup_->table_[i].idx);
-    printf("  CELL: %u\n", d_lookup_->table_[i].cell_key);
-  }
-
-  for (uint32_t i = 0; i < n_partitions; ++i) {
-    printf("CELL %u\n", i);
-    printf("  START: %u\n", d_lookup_->start_cell[i]);
-    printf("  END  : %u\n", d_lookup_->end_cell[i]);
-  }
-}
-
 /**
  * Host function to call individual kernels to set values of table 
  */
@@ -282,9 +266,6 @@ __host__ void hostFillTable(Lookup *d_lookup_, particleContainer *d_particleCont
   // Might not be optimal as there are a maximum number of threads and is inflexible
   static uint32_t insert_threads = 0, table_threads = 0;
   static uint32_t insert_blocks = 0, table_blocks = 0;
-
-  static int iter;
-  if (insert_blocks == 0) iter = 0;
 
   setGridSize(&insert_blocks, &insert_threads, n_partitions);
   setGridSize(&table_blocks, &table_threads, padded_size);
@@ -307,11 +288,7 @@ __host__ void hostFillTable(Lookup *d_lookup_, particleContainer *d_particleCont
   // Set the start and end cell arrays
   setTableIndexes<<<table_blocks, table_threads>>>(d_lookup_, n_partitions, n_particles);
 
-  if (iter == 0)
-    printTable<<<1 ,1>>>(d_lookup_, n_partitions, n_particles);
-
   cudaDeviceSynchronize();
-  iter++;
 }
 
 /**
@@ -333,15 +310,43 @@ __host__ void initalizeSimulation(
   float minimum = container[0] - 2 * h;
 
   // Generate the axis count for each 
-  std::vector<uint16_t> containerID(3, 0);
+  std::vector<uint32_t> containerID(3, 0);
   (*n_partitions) = 1;
   for (int i = 0; i < 3; ++i) {
-    containerID[i] = static_cast<uint16_t>(floor(container[i] / (2.0 * h)));
+    containerID[i] = static_cast<uint32_t>(floor(container[i] / (2.0 * h)));
+    // std::cout << "Axis " << i + 1 << " max: " << containerID[i] << '\n'; 
     (*n_partitions) *= static_cast<uint32_t>(containerID[i]);
   }
+/*
+  std::cout << "Container 1: " << containerID[0] << '\n';
+  std::cout << "Container 2: " << containerID[1] << '\n';
+  std::cout << "Container 3: " << containerID[2] << '\n';
 
   convertToPrime(n_partitions);
- 
+
+  // counts the occurance of each hash value
+  std::vector<int> counter((*n_partitions), 0);
+
+  for (uint32_t i = 0; i < containerID[0]; ++i) {
+    for (uint32_t j = 0; j < containerID[1]; ++j) {
+      for (uint32_t k = 0; k < containerID[2]; ++k) {
+        int3 key = make_int3(i, j, k);
+        uint32_t hash = hashPosition(key, (*n_partitions));
+        counter[hash]++;
+        std::cout << "Key : <" << i << "," << j << "," << k << "> maps to hash: " << hash << '\n';
+      }
+    }
+  }
+  
+  int intersecting = 0;
+  for (uint32_t i = 0; i < (*n_partitions); ++i) {
+    if (counter[i] > 1) {
+      std::cout << "Number of Cells that Map to " << i << " : " << counter[i] << '\n';
+      intersecting++; 
+    }
+  }
+  std::cout << "Number of intersecting cell coordiantes: " << intersecting << "\n";
+*/
   // Get size of arr on order 2^n
   uint32_t paddedSize = findSquare(n_particles); 
   
@@ -369,11 +374,12 @@ __host__ void initalizeSimulation(
   );
 
   // Coalesced device ptrs 
-  float *u_pos, *u_vel, *u_prf, *u_visf, *u_mass, *u_dens, *u_pr;
+  float *u_pos, *u_vel, *u_prf, *u_visf, *u_repf, *u_mass, *u_dens, *u_pr;
   cudaMallocManaged(&u_pos, n_particles * 3 * sizeof(float));
   cudaMallocManaged(&u_vel, n_particles * 3 * sizeof(float));
   cudaMallocManaged(&u_prf, n_particles * 3 * sizeof(float));
   cudaMallocManaged(&u_visf, n_particles * 3 * sizeof(float));
+  cudaMallocManaged(&u_repf, n_particles * 3 * sizeof(float));
   cudaMallocManaged(&u_mass, n_particles * sizeof(float));
   cudaMallocManaged(&u_dens, n_particles * sizeof(float));
   cudaMallocManaged(&u_pr, n_particles * sizeof(float));
@@ -387,6 +393,7 @@ __host__ void initalizeSimulation(
     u_vel,
     u_prf,
     u_visf,
+    u_repf,
     u_mass,
     u_dens,
     u_pr,

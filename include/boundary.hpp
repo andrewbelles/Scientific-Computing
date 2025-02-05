@@ -16,7 +16,7 @@ struct Container {
 
 __host__ void updateBounds(Lookup *d_lookup_, particleContainer *d_objs_, std::vector<float> new_container, uint32_t particle_recount, const float h);
 
-__host__ void callToBoundaryConditions(struct Container boundary, particleContainer *d_objs_, uint32_t n_particles, uint32_t n_partitions, const float h);
+__host__ void callToBoundaryConditions(struct Container boundary, particleContainer *d_objs_, uint32_t n_particles, const float h);
 
 
 #endif // __BOUNDARY_HPP__

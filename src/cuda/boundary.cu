@@ -1,5 +1,4 @@
 #include "boundary.hpp"
-#include "spatial.hpp"
 
 __host__ static inline bool equal(std::vector<float> new_container, std::vector<float> boundary) {
   for (int i = 0; i < 3; ++i) {
@@ -29,7 +28,7 @@ __host__ void updateBounds(Lookup *d_lookup_, particleContainer *d_objs_, std::v
   }
 
   // Set partition count
-  if (!n_partitions) {
+  if (n_partitions == 0) {
     // Count the number of partitions ("volume")
     uint32_t partition_counter[3];
     n_partitions = 1;
@@ -37,7 +36,7 @@ __host__ void updateBounds(Lookup *d_lookup_, particleContainer *d_objs_, std::v
       partition_counter[i] = static_cast<uint32_t>(float(boundary[i] / (2.0 * h)));
       n_partitions *= partition_counter[i];
     }
-    convertToPrime(&n_partitions);
+    n_partitions = convertToPrime(n_partitions);
   }
 
   // Set particle count
@@ -70,13 +69,14 @@ __host__ void updateBounds(Lookup *d_lookup_, particleContainer *d_objs_, std::v
 
     delete (d_objs_);
 
-    float *n_prf, *n_visf, *n_mass, *n_dens, *n_pr;
+    float *n_prf, *n_visf, *n_repf, *n_mass, *n_dens, *n_pr;
 
     new (d_objs_) particleContainer();
 
     // Allocate accumulators
     cudaMallocManaged(&n_prf, particle_recount * 3 * sizeof(float));
     cudaMallocManaged(&n_visf, particle_recount * 3 * sizeof(float));
+    cudaMallocManaged(&n_repf, particle_recount * 3 * sizeof(float));
     cudaMallocManaged(&n_mass, particle_recount * sizeof(float));
     cudaMallocManaged(&n_dens, particle_recount * sizeof(float));
     cudaMallocManaged(&n_pr, particle_recount * sizeof(float));
@@ -96,6 +96,7 @@ __host__ void updateBounds(Lookup *d_lookup_, particleContainer *d_objs_, std::v
     d_objs_->slowSetAccumulators(
       n_prf,
       n_visf,
+      n_repf,
       n_mass,
       n_dens,
       n_pr,
@@ -108,41 +109,52 @@ __host__ void updateBounds(Lookup *d_lookup_, particleContainer *d_objs_, std::v
     // Not worrying about it right now
   }
 }
+
 /*
-   Kernel call to naively, individually rectify potential out of bounds behavior for a particle 
-   */
-__global__ static void boundaryKernel(const struct Container boundary, particleContainer *d_objs_, uint32_t n_particles, int32_t n_partitions, const float abs_radius) {
-uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
+ * Kernel call to naively, individually rectify potential out of bounds behavior for a particle 
+ */
+__global__ static void boundaryKernel(const struct Container boundary, particleContainer *d_objs_, uint32_t n_particles, const float smooth_radius) {
+  uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
   if (idx >= n_particles) return;
-  const float restitution = 0.8;
+  const float strength = 1000, cutoff = 2 * smooth_radius, decay_length = 0.1 * cutoff;
+
+  // Calculate the repulsive force in each direction from boundary
+  float3 repulsive_potential, position = make_float3(
+    d_objs_->positions[idx],
+    d_objs_->positions[idx + n_particles],
+    d_objs_->positions[idx + 2 * n_particles]
+  );
+  float3 upper_distance = make_float3(
+    boundary.upper[0],
+    boundary.upper[1],
+    boundary.upper[2]
+  );
   
-  // Overlap values
-  float upperDistance[3], lowerDistance[3];
+  // Array of pointers to float3 struct 
+  float *rp[]  = {&repulsive_potential.x, &repulsive_potential.y, &repulsive_potential.z};
+  float *pos[] = {&position.x, &position.y, &position.z};
+  float *upp[] = {&upper_distance.x, &upper_distance.y, &upper_distance.z};
   
+  // Loop over each axis 
   for (int i = 0; i < 3; ++i) {
-    uint32_t co = idx + i * n_particles;
+    *upp[i] -= *pos[i];
 
-    upperDistance[i] = boundary.upper[i] - d_objs_->positions[co] - abs_radius;
-    lowerDistance[i] = d_objs_->positions[co] + abs_radius - boundary.lower[i];
+    // Store position: If the distance to upper bound is less than the true position than it is closer to the upper bound than the lower
+    // *The lower bound is defined at 0.0 for each axii
+    float position = (*upp[i] < *pos[i]) ? (*upp[i]) : *pos[i];
+    float A = (*upp[i] < *pos[i]) ? -1.0 * strength : strength;
 
-    // Rectify overlap 
-    if (upperDistance[i] < abs_radius + tol) {
-      // Adjust for upper bounds overlap
-      d_objs_->velocities[co] *= -restitution;
-      d_objs_->positions[co] -= upperDistance[i];
-    } else if (lowerDistance[i] < abs_radius + tol) {
-      // Adjust for lower bounds overlap
-      d_objs_->velocities[co] *= -restitution; 
-      d_objs_->positions[co] += lowerDistance[i];
-    }
-  }
+    // Find the potential and divide by decay length for force 
+    *rp[i] = (position < cutoff) ? A * exp(-(position - cutoff) / decay_length) : 0.0;
+    d_objs_->repulsive_forces[idx + i * n_particles] = *rp[i] / decay_length;
+  } 
 }
 
 /*
-   Host call to handle the call to boundaryKernel 
-   Sets the range of acceptable thread idx to act on particles 
-   */
-__host__ void callToBoundaryConditions(struct Container boundary, particleContainer *d_objs_, uint32_t n_particles, uint32_t n_partitions, const float h) {
+ * Host call to handle the call to boundaryKernel 
+ * Sets the range of acceptable thread idx to act on particles 
+ */
+__host__ void callToBoundaryConditions(struct Container boundary, particleContainer *d_objs_, uint32_t n_particles, const float h) {
 
   static uint32_t blocks = 0, threads = 0;
   setGridSize(&blocks, &threads, n_particles);
@@ -152,8 +164,7 @@ __host__ void callToBoundaryConditions(struct Container boundary, particleContai
     boundary,
     d_objs_,
     n_particles,
-    n_partitions,
-    h * 0.1   // Absolute radius
-  );    // First time d_particles_ is called by device -> Must be migrated to device
+    h
+  );
   cudaDeviceSynchronize();
 }

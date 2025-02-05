@@ -1,13 +1,12 @@
 #include "integrate.hpp"
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
-#include <thrust/scan.h>
 #include <vector_functions.h>
 
 // Defines 
 #define k 3000
 #define rho0 1000
-#define dt 5e-4       // Change to dynamically shift in value 
+#define dt 5e-8      // Change to dynamically shift in value 
 #define viscosity 5e-2
 
 // #define __debug
@@ -31,11 +30,9 @@ __host__ __device__ static inline float3 operator*(const float3 a, const float v
 }
 
 __host__ __device__ static inline void operator+=(float3 &a, float3 b) {
-  float *vec_a[] = {&a.x, &a.y, &a.z};
-  float *vec_b[] = {&b.x, &b.y, &b.z};
-
-  for (int i = 0; i < 3; ++i)
-    *vec_a[i] += *vec_b[i];
+  a.x += b.x;
+  a.y += b.y;
+  a.z += b.z;
 }
 
 __host__ __device__ static inline float3 operator-(const float3 a, const float3 b) {
@@ -43,11 +40,9 @@ __host__ __device__ static inline float3 operator-(const float3 a, const float3 
 }
 
 __host__ __device__ static inline void operator-=(float3 &a, float3 b) {
-  float *vec_a[] = {&a.x, &a.y, &a.z};
-  float *vec_b[] = {&b.x, &b.y, &b.z};
-
-  for (int i = 0; i < 3; ++i)
-    *vec_a[i] -= *vec_b[i];
+  a.x -= b.x;
+  a.y -= b.y;
+  a.z -= b.z;
 }
 
 /**
@@ -156,7 +151,8 @@ __global__ static void computeDensities(
   uint32_t n_partitions,
   uint32_t n_particles,
   uint32_t containerCount[3],
-  float h
+  float h,
+  bool first
 ) { 
   uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
   if (idx >= n_particles) return; 
@@ -198,6 +194,8 @@ __global__ static void computeDensities(
 
       rel = d_lookup_->table_[j].idx;
 
+      if (rel == pid) continue;
+
       relative_pos = make_float3(
         d_objs_->positions[rel],
         d_objs_->positions[rel + n_particles],
@@ -209,15 +207,14 @@ __global__ static void computeDensities(
       distance = magnitude(displace);
 
       if (distance > 2.0 * h) continue;
-
       // Denstity calculation
       d_objs_->densities[pid] += d_objs_->masses[rel] * cubicSpline(distance, h);
-      printf("density %u: %lf\n", pid, d_objs_->densities[pid]);
-
+      if (pid == 0 && first) {
+        printf("Density = %f summed from relative %u\n", d_objs_->densities[pid], rel);
+      }
     }
   }
-  d_objs_->pressures[pid] = 343.0 * (pow(d_objs_->densities[pid] / rho0, 7) - 1.0);
-  printf("pressure %u: %lf\n", pid, d_objs_->pressures[pid]);
+  d_objs_->pressures[pid] = k * (d_objs_->densities[pid] - rho0);
 }
 
 __global__ static void computeForces(
@@ -266,6 +263,8 @@ __global__ static void computeForces(
 
       rel = d_lookup_->table_[j].idx;
 
+      if (rel == pid) continue;
+
       relative_pos = make_float3(
         d_objs_->positions[rel],
         d_objs_->positions[rel + n_particles],
@@ -297,10 +296,15 @@ __global__ static void computeForces(
       float pressure_value  = d_objs_->pressures[idx] / (d_objs_->densities[idx] * d_objs_->densities[idx]);
       pressure_value       += d_objs_->pressures[rel] / (d_objs_->densities[rel] * d_objs_->densities[rel]);
 
+      //float kernel_val = gradCubicSpline(distance, h);
+      //if (kernel_val > 100 || pressure_value)
+      //  printf("pid %u kernel_val %f pressure_val %f\n", pid, kernel_val, pressure_value);
+
       float common_term    = d_objs_->masses[rel] * pressure_value * gradCubicSpline(distance, h);
 
       pressure_force  -= (direction * common_term);  
       viscosity_force += (((local_vel - relative_vel) * d_objs_->masses[rel] / d_objs_->densities[rel]) * laplacianCubicSpline(distance, h));
+      //printf("press force %u: <%f,%f,%f>\nviscf force %u: <%f,%f,%f>\n", pid, pressure_force.x, pressure_force.y, pressure_force.z, pid, viscosity_force.x, viscosity_force.y, viscosity_force.z);
     }
   }
 
@@ -323,7 +327,8 @@ __host__ void neighborSearch(
   uint32_t n_partitions, 
   uint32_t n_particles,
   uint32_t containerCount[3],
-  float h
+  float h,
+  bool first
 ) {
   static uint32_t blocks = 0, threads = 0;
   setGridSize(&blocks, &threads, n_particles);
@@ -335,7 +340,8 @@ __host__ void neighborSearch(
     n_partitions,
     n_particles,
     containerCount,
-    h
+    h,
+    first
   );
 
   err = cudaGetLastError();
@@ -351,7 +357,7 @@ __host__ void neighborSearch(
     std::cerr << "Force Sync: " << cudaGetErrorString(err) << '\n';
     exit(EXIT_FAILURE);
   }
-
+  
   // Expected success 
   computeForces<<<blocks, threads>>>(
     d_objs_,
@@ -389,9 +395,9 @@ __global__ void firstVerletKernel(particleContainer *d_objs_, uint32_t n_particl
   // Position and velocity update loop
   for (int i = 0; i < 3; ++i) {
     uint32_t co = idx + i * n_particles;
-   
     // Sums the pressure and viscosity forces for each axis
-    forceSum[i] += (d_objs_->pressure_forces[co] + d_objs_->viscosity_forces[co]);
+    // printf("idx %u repulsive force co %u : %f\n", idx, co, d_objs_->repulsive_forces[co]);
+    forceSum[i] += (scale_factor * (d_objs_->pressure_forces[co] + d_objs_->viscosity_forces[co] + d_objs_->repulsive_forces[co]));
     
     // Integrates the velocity and position
     d_objs_->velocities[co] += (forceSum[i] * static_cast<float>(0.5 * dt));
@@ -412,7 +418,7 @@ __global__ void secondVerletKernel(particleContainer *d_objs_, uint32_t n_partic
   for (int i = 0; i < 3; ++i) {
     uint32_t co = idx + i * n_particles;
     // Sum forces from previous iteration 
-    forceSum[i] += ((d_objs_->pressure_forces[co] + d_objs_->viscosity_forces[co]) / d_objs_->masses[idx]);
+    forceSum[i] += (scale_factor * (d_objs_->pressure_forces[co] + d_objs_->viscosity_forces[co]) / d_objs_->masses[idx] + d_objs_->repulsive_forces[co]);
     
     // Second half step to fully velocity
     d_objs_->velocities[co] += (forceSum[i] * static_cast<float>(0.5 * dt));
