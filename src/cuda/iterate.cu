@@ -39,9 +39,7 @@ __global__ static void updateHostBuffer(
 /* Generates positions from particle array */
 
 __host__ void particleIterator(
-  neighborList *list,
   particleContainer *d_objs_,
-  uint32_t *list_size,
   float **u_positions,
   float **u_densities,
   Lookup *d_lookup_,
@@ -95,15 +93,13 @@ __host__ void particleIterator(
   if (containerCount == NULL) {
     cudaMallocManaged(&containerCount, 3 * sizeof(uint32_t));
     for (int i = 0; i < 3; ++i) {
-      containerCount[i] = static_cast<uint32_t>(floor(container[i] / h));
+      containerCount[i] = static_cast<uint32_t>(floor(container[i] / (2.0 * h)));
     }
   };
 
   // Calls the neighbor search
   neighborSearch(
-    list,
     d_objs_,
-    list_size, 
     d_lookup_,
     n_partitions,
     n_particles,

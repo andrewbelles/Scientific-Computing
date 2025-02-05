@@ -1,11 +1,4 @@
-#include "integrate.hpp"
 #include "spatial.hpp"
-#include <cstdlib>
-#include <cuda.h>
-#include <cuda_device_runtime_api.h>
-#include <cuda_runtime_api.h>
-#include <driver_types.h>
-#include <surface_types.h>
 
 /**
  * Refactor: 
@@ -29,6 +22,38 @@ __host__ inline void setGridSize(uint32_t *blocks, uint32_t *threads, uint32_t a
 #ifdef __debug
   std::cout << "Set grid sizes to: (" << (*blocks) << " x " << (*threads) << ")\n";
 #endif
+}
+
+/*
+ * Simple boolean function to return if prime or not. From chat gpt-4o
+ */
+template <typename T>
+bool isPrime(T val) {
+  if (val <= 1) {
+        return false;
+    }
+    if (val <= 3) {
+        return true;
+    }
+    if (val % 2 == 0 || val % 3 == 0) {
+        return false;
+    } 
+    for (int i = 5; i * i <= val; i += 6) {
+        if (val % i == 0 || val % (i + 2) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * Increments value till its prime : Inefficient I know
+ */
+template <typename T>
+void convertToPrime(T *val) {
+  while (!isPrime(*val)) {
+    (*val)++;
+  }
 }
 
 /**
@@ -94,12 +119,10 @@ T findSquare(T value) {
  */
 __device__ int3 positionToCellCoord(float3 position, const float h) {
   int3 cell_coord;
-  int *cell[]  = {&cell_coord.x, &cell_coord.y, &cell_coord.z};
-  float *pos[] = {&position.x, &position.y, &position.z};
 
-#pragma unroll
-  for (int i = 0; i < 3; ++i) 
-    *cell[i] = static_cast<int>(floorf(*pos[i] / h));
+  cell_coord.x = floorf(position.x / (2.0 * h));
+  cell_coord.y = floorf(position.y / (2.0 * h));
+  cell_coord.z = floorf(position.z / (2.0 * h));
 
   return cell_coord;
 }
@@ -109,14 +132,14 @@ __device__ int3 positionToCellCoord(float3 position, const float h) {
  */
 __device__ uint32_t hashPosition(int3 cell_coord, uint32_t n_partitions) {
   const uint64_t primes[] = {73856093, 19349663, 83492791};   // Local hash primes array
-  const int *cell[]       = {&cell_coord.x, &cell_coord.y, &cell_coord.z};
   uint32_t hash = 0;
 
   // Distribute from prime values
   // Promote int32_t to 64_t by multiplying by uint64_t
-  for (int i = 0; i < 3; ++i) {
-    hash += *cell[i] * primes[i];
-  }
+  hash = cell_coord.x * primes[0];
+  hash += cell_coord.y * primes[1];
+  hash += cell_coord.z * primes[2]
+  ;
   // Return hash fit into partition size
   return hash % n_partitions;
 }
@@ -238,6 +261,20 @@ __global__ static void setTableIndexes(Lookup *d_lookup_, uint32_t n_partitions,
   }
 }
 
+__global__ static void printTable(Lookup *d_lookup_, uint32_t n_partitions, uint32_t n_particles) {
+  for (uint32_t i = 0; i < n_particles; ++i) {
+    printf("TABLE %u\n", i);
+    printf("  IDX:  %u\n", d_lookup_->table_[i].idx);
+    printf("  CELL: %u\n", d_lookup_->table_[i].cell_key);
+  }
+
+  for (uint32_t i = 0; i < n_partitions; ++i) {
+    printf("CELL %u\n", i);
+    printf("  START: %u\n", d_lookup_->start_cell[i]);
+    printf("  END  : %u\n", d_lookup_->end_cell[i]);
+  }
+}
+
 /**
  * Host function to call individual kernels to set values of table 
  */
@@ -245,6 +282,9 @@ __host__ void hostFillTable(Lookup *d_lookup_, particleContainer *d_particleCont
   // Might not be optimal as there are a maximum number of threads and is inflexible
   static uint32_t insert_threads = 0, table_threads = 0;
   static uint32_t insert_blocks = 0, table_blocks = 0;
+
+  static int iter;
+  if (insert_blocks == 0) iter = 0;
 
   setGridSize(&insert_blocks, &insert_threads, n_partitions);
   setGridSize(&table_blocks, &table_threads, padded_size);
@@ -267,7 +307,11 @@ __host__ void hostFillTable(Lookup *d_lookup_, particleContainer *d_particleCont
   // Set the start and end cell arrays
   setTableIndexes<<<table_blocks, table_threads>>>(d_lookup_, n_partitions, n_particles);
 
+  if (iter == 0)
+    printTable<<<1 ,1>>>(d_lookup_, n_partitions, n_particles);
+
   cudaDeviceSynchronize();
+  iter++;
 }
 
 /**
@@ -285,16 +329,18 @@ __host__ void initalizeSimulation(
   /*float maximum = min(container) - 1.0;
   float minimum = maximum - (max(container) - min(container));*/ 
   // Hard coded values
-  float maximum = 9.0;
-  float minimum = 1.0;
+  float maximum = 2 * h;
+  float minimum = container[0] - 2 * h;
 
   // Generate the axis count for each 
   std::vector<uint16_t> containerID(3, 0);
   (*n_partitions) = 1;
   for (int i = 0; i < 3; ++i) {
-    containerID[i] = static_cast<uint16_t>(floor(container[i] / h));
+    containerID[i] = static_cast<uint16_t>(floor(container[i] / (2.0 * h)));
     (*n_partitions) *= static_cast<uint32_t>(containerID[i]);
   }
+
+  convertToPrime(n_partitions);
  
   // Get size of arr on order 2^n
   uint32_t paddedSize = findSquare(n_particles); 

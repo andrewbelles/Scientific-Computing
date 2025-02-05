@@ -1,8 +1,6 @@
 #include "boundary.hpp"
 #include "spatial.hpp"
 
-#define tol 1e-4
-
 __host__ static inline bool equal(std::vector<float> new_container, std::vector<float> boundary) {
   for (int i = 0; i < 3; ++i) {
     if (new_container[i] != boundary[i]) return false;
@@ -36,10 +34,10 @@ __host__ void updateBounds(Lookup *d_lookup_, particleContainer *d_objs_, std::v
     uint32_t partition_counter[3];
     n_partitions = 1;
     for (int i = 0; i < 3; ++i) {
-      partition_counter[i] = static_cast<uint32_t>(float(boundary[i] / h));
+      partition_counter[i] = static_cast<uint32_t>(float(boundary[i] / (2.0 * h)));
       n_partitions *= partition_counter[i];
     }
-
+    convertToPrime(&n_partitions);
   }
 
   // Set particle count
@@ -54,8 +52,8 @@ __host__ void updateBounds(Lookup *d_lookup_, particleContainer *d_objs_, std::v
     if (findSquare(particle_recount) != findSquare(n_particles))
       setLookup = true;
     
-    float minimum = 1.0;
-    float maximum = 9.0;  // Hardcoded for now
+    float minimum = 2 * h;
+    float maximum = boundary[0] - 2 * h;  // Hardcoded for now
 
     // We can pull the position and velocity vectors and then delete everything else and create a new ptr
     float *n_pos, *n_vel;
@@ -155,7 +153,7 @@ __host__ void callToBoundaryConditions(struct Container boundary, particleContai
     d_objs_,
     n_particles,
     n_partitions,
-    h * 0.2   // Absolute radius
+    h * 0.1   // Absolute radius
   );    // First time d_particles_ is called by device -> Must be migrated to device
   cudaDeviceSynchronize();
 }

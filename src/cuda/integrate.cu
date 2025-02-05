@@ -1,14 +1,20 @@
 #include "integrate.hpp"
+#include <cuda_runtime.h>
+#include <cuda_runtime_api.h>
+#include <thrust/scan.h>
+#include <vector_functions.h>
 
 // Defines 
 #define k 3000
 #define rho0 1000
-#define dt 1e-3       // Change to dynamically shift in value 
-#define viscosity 1e-2
+#define dt 5e-4       // Change to dynamically shift in value 
+#define viscosity 5e-2
+
+// #define __debug
+// #define __verbose
 
 // Offset table for kernel 
 __constant__ int3 offset_table[27];
-static float max_neighbors;
 
 __device__ static inline float magnitude(const float3 a) {
   return sqrtf(a.x * a.x + a.y * a.y + a.z * a.z);
@@ -141,35 +147,17 @@ __device__ static inline int3 operator+(int3 a, int3 b) {
   return make_int3(a.x + b.x, a.y + b.y, a.z + b.z);
 }
 
-__host__ neighborList *initNeighborList(uint32_t *list_size, uint32_t n_particles) {
-  max_neighbors = (n_particles * 0.5);
-  (*list_size) = static_cast<uint32_t>(n_particles * (max_neighbors - 1));
-
-  neighborList *list = nullptr;
-
-  cudaMallocManaged(&list->neighbors, (*list_size) * sizeof(int));
-  cudaMallocManaged(&list->offsets, (n_particles + 1) * sizeof(int));
-  cudaMallocManaged(&list->counts, n_particles * sizeof(int));
-
-  cudaMallocManaged(&list, sizeof(neighborList));
-
-  return list;
-}
-
-/*
- * Iterate over 3x3x3 centered by idx and determine number of neighbors for particle
+/**
+ * Find the density, pressure, and system forces from the built neighbor list
  */
-__global__ static void countNeighbors(
-  neighborList *list,
+__global__ static void computeDensities(
   particleContainer *d_objs_,
-  uint32_t list_size,
   Lookup *d_lookup_,
   uint32_t n_partitions,
   uint32_t n_particles,
   uint32_t containerCount[3],
   float h
-) {
-
+) { 
   uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
   if (idx >= n_particles) return; 
   
@@ -203,6 +191,9 @@ __global__ static void countNeighbors(
     // Empty bucket check
     if (start == UINT32_MAX || end == UINT32_MAX) continue;
 
+    if (start >= n_particles || end > n_particles)
+      printf("idx %u pid %u start %u end %u\n", idx, pid, start, end);
+
     for (uint32_t j = start; j < end; ++j) {
 
       rel = d_lookup_->table_[j].idx;
@@ -215,35 +206,37 @@ __global__ static void countNeighbors(
 
       // Find distance 
       displace = local_pos - relative_pos;
-      distance= magnitude(displace);
+      distance = magnitude(displace);
 
       if (distance > 2.0 * h) continue;
 
-      list->counts[idx]++;
+      // Denstity calculation
+      d_objs_->densities[pid] += d_objs_->masses[rel] * cubicSpline(distance, h);
+      printf("density %u: %lf\n", pid, d_objs_->densities[pid]);
+
     }
   }
+  d_objs_->pressures[pid] = 343.0 * (pow(d_objs_->densities[pid] / rho0, 7) - 1.0);
+  printf("pressure %u: %lf\n", pid, d_objs_->pressures[pid]);
 }
 
-__global__ static void findNeighbors(
-  neighborList *list,
+__global__ static void computeForces(
   particleContainer *d_objs_,
-  int status,
-  uint32_t list_size,
   Lookup *d_lookup_,
   uint32_t n_partitions,
   uint32_t n_particles,
   uint32_t containerCount[3],
   float h
 ) {
-
   uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
   if (idx >= n_particles) return; 
   
   uint32_t pid = d_lookup_->table_[idx].idx;
-  uint32_t count = 0, rel = 0, hash = 0, start = 0, end = 0;
+  uint32_t rel = 0, hash = 0, start = 0, end = 0;
   int3 cell_coord, relative_coord;
 
   float3 relative_pos, displace;
+  float3 pressure_force = make_float3(0.0, 0.0, 0.0), viscosity_force = make_float3(0.0, 0.0, 0.0);
   float3 local_pos = make_float3(
     d_objs_->positions[pid],
     d_objs_->positions[pid + n_particles],
@@ -284,115 +277,31 @@ __global__ static void findNeighbors(
       distance= magnitude(displace);
 
       if (distance > 2.0 * h) continue;
-      
-      int ptr = list->offsets[idx] + count++;
-      if (ptr >= list_size) {
-        atomicExch(&status, 1);
-        return;
-      }
 
-      list->neighbors[ptr] = rel; 
+      float3 local_vel = make_float3(
+        d_objs_->velocities[pid],
+        d_objs_->velocities[pid + n_particles],
+        d_objs_->velocities[pid + 2 * n_particles]
+      );
+
+      float3 relative_vel = make_float3( 
+        d_objs_->velocities[rel],
+        d_objs_->velocities[rel + n_particles],
+        d_objs_->velocities[rel + 2 * n_particles]
+      );
+
+      // Unit vector of direction calculation 
+      float3 direction = displace / (distance + tol);
+
+      // Calculate the intermediate values for the pressure force;
+      float pressure_value  = d_objs_->pressures[idx] / (d_objs_->densities[idx] * d_objs_->densities[idx]);
+      pressure_value       += d_objs_->pressures[rel] / (d_objs_->densities[rel] * d_objs_->densities[rel]);
+
+      float common_term    = d_objs_->masses[rel] * pressure_value * gradCubicSpline(distance, h);
+
+      pressure_force  -= (direction * common_term);  
+      viscosity_force += (((local_vel - relative_vel) * d_objs_->masses[rel] / d_objs_->densities[rel]) * laplacianCubicSpline(distance, h));
     }
-  }
-}
-
-/**
- * Find the density, pressure, and system forces from the built neighbor list
- */
-__global__ static void computeDensities(
-  neighborList *list,
-  particleContainer *d_objs_,
-  uint32_t n_particles,
-  float h
-) { 
-  uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
-  if (idx >= n_particles) return; 
-
-  // In this function idx == pid therefore idxth value of neighbors 
-
-  float3 local_pos = make_float3(
-    d_objs_->positions[idx],
-    d_objs_->positions[idx + n_particles],
-    d_objs_->positions[idx + 2 * n_particles]
-  );
-
-  for (int i = list->offsets[idx]; i < list->offsets[idx + 1]; ++i) {
-
-    uint32_t rel = list->neighbors[i];
-
-    float3 relative_pos = make_float3(
-      d_objs_->positions[rel],
-      d_objs_->positions[rel + n_particles],
-      d_objs_->positions[rel + 2 * n_particles] 
-    );
-
-    // Find distance
-    float3 displace = local_pos - relative_pos;
-    float distance  = magnitude(displace);
-
-    // Find density sum
-    d_objs_->densities[idx] += d_objs_->masses[rel] * cubicSpline(distance, h);
-  }
-  d_objs_->pressures[idx] = k * (d_objs_->densities[idx] - rho0);
-}
-
-__global__ static void computeForces(
-  neighborList *list,
-  particleContainer *d_objs_,
-  uint32_t n_particles,
-  const float h
-) {
-  uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
-  if (idx >= n_particles) return; 
-
-  // Set local values
-  float3 pressure_force  = make_float3(0.0, 0.0, 0.0);
-  float3 viscosity_force = make_float3(0.0, 0.0, 0.0);
-
-  float3 local_pos = make_float3(
-    d_objs_->positions[idx],
-    d_objs_->positions[idx + n_particles],
-    d_objs_->positions[idx + 2 * n_particles]
-  );
- 
-  float3 local_vel = make_float3(
-    d_objs_->velocities[idx],
-    d_objs_->velocities[idx + n_particles],
-    d_objs_->velocities[idx + 2 * n_particles]
-  );
-
-
-  // Loop over neighbor indexes
-  for (uint32_t i = list->offsets[idx]; i < list->offsets[idx + 1]; ++i) {
-    // Set the relative particle id
-    uint32_t rel = list->neighbors[i];
-    
-    float3 relative_pos = make_float3(
-      d_objs_->positions[rel],
-      d_objs_->positions[rel + n_particles],
-      d_objs_->positions[rel + 2 * n_particles] 
-    );
-
-    // Find distance
-    float3 displace = local_pos - relative_pos;
-    float distance  = magnitude(displace);
-
-    float3 relative_vel = make_float3( 
-      d_objs_->velocities[rel],
-      d_objs_->velocities[rel + n_particles],
-      d_objs_->velocities[rel + 2 * n_particles]
-    );
-
-    // Unit vector of direction calculatio 
-    float3 direction = displace / (distance + tol);
-
-    // Calculate the intermediate values for the pressure force;
-    float pressure_value  = d_objs_->pressures[idx] / (d_objs_->densities[idx] * d_objs_->densities[idx]);
-    pressure_value       += d_objs_->pressures[rel] / (d_objs_->densities[rel] * d_objs_->densities[rel]); 
-    float common_term    = d_objs_->masses[rel] * pressure_value * gradCubicSpline(distance, h);
-
-    pressure_force  -= (direction * common_term);  
-    viscosity_force += (((local_vel - relative_vel) * d_objs_->masses[rel] / d_objs_->densities[rel]) * laplacianCubicSpline(distance, h));
   }
 
   // Set forces 
@@ -405,88 +314,27 @@ __global__ static void computeForces(
   d_objs_->viscosity_forces[idx + 2 * n_particles] = viscosity_force.z;
 }
 
-__global__ static void resetCounts(int *counts, uint32_t n_particles) {
-  for (int i = 0; i < n_particles; i++) {
-    counts[i] = 0;
-  }
-}
-
 /**
  * Host function to call the search kernel to find each particles forces relative to itself
  */
 __host__ void neighborSearch(
-  neighborList *list,
   particleContainer *d_objs_,
   Lookup *d_lookup_,
   uint32_t n_partitions, 
   uint32_t n_particles,
   uint32_t containerCount[3],
-  uint32_t *list_size,
   float h
 ) {
   static uint32_t blocks = 0, threads = 0;
   setGridSize(&blocks, &threads, n_particles);
-  int status = 0;
   cudaError_t err;
 
-  // Perform computation until neighbor list is valid sized 
-  do {
-    countNeighbors<<<blocks, threads>>>(
-      list,
-      d_objs_,
-      (*list_size), 
-      d_lookup_,
-      n_partitions,
-      n_particles,
-      containerCount,
-      h
-    );
-
-    // Find prefix sum of list stored at offsets 
-    thrust::exclusive_scan(thrust::device, list->counts, list->counts + n_particles, list->offsets);
-
-    findNeighbors<<<blocks, threads>>>(
-      list,
-      d_objs_,
-      status,
-      (*list_size), 
-      d_lookup_,
-      n_partitions,
-      n_particles,
-      containerCount,
-      h
-    );
-    
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-      std::cerr << "Neighbor List: " << cudaGetErrorString(err) << '\n';
-      exit(EXIT_FAILURE);
-    }
-
-    // Wait for all threads to complete before restarting if size error
-    cudaDeviceSynchronize();
-   
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-      std::cerr << "List sync: " << cudaGetErrorString(err) << '\n';
-      exit(EXIT_FAILURE);
-    }
-    
-    // Neighbors list size error
-    if (status == 1) {
-      // Take truncated value of 3/2 k and resize neighbors list
-      max_neighbors = max_neighbors / n_particles + max_neighbors * 0.5;
-      (*list_size) = static_cast<uint32_t>(n_particles * (max_neighbors - 1));
-      cudaFree(list->neighbors);
-      cudaMallocManaged(&list->neighbors, (*list_size) * n_particles * sizeof(uint32_t));
-    }
-
-  } while (status != 0); 
-
   computeDensities<<<blocks, threads>>>(
-    list,
     d_objs_,
+    d_lookup_,
+    n_partitions,
     n_particles,
+    containerCount,
     h
   );
 
@@ -506,12 +354,14 @@ __host__ void neighborSearch(
 
   // Expected success 
   computeForces<<<blocks, threads>>>(
-    list,
     d_objs_,
+    d_lookup_,
+    n_partitions,
     n_particles,
+    containerCount,
     h
   );
-  
+
   err = cudaGetLastError();
   if (err != cudaSuccess) {
     std::cerr << "Force Compute: " << cudaGetErrorString(err) << '\n';
@@ -525,8 +375,6 @@ __host__ void neighborSearch(
     std::cerr << "Force Sync: " << cudaGetErrorString(err) << '\n';
     exit(EXIT_FAILURE);
   }
-
-  resetCounts<<<1, 1>>>(list->counts, n_particles);
 }
 
 /*

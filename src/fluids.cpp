@@ -41,21 +41,21 @@ int main(int argc, char *argv[])
   float yaw = 0.0, pitch = 0.0, fov = 60.0;
   float near_plane = 0.1, far_plane = 100.0, aspect_ratio = 1280.0 / 720.0;
   float last_mouse_x = 0.0, last_mouse_y = 0.0, x_offset = 0.0, y_offset = 0.0, sensititivity = 5e-5;
-  float particle_spacing = cube_size / cbrt(particle_count), h;
+  float h;
   float radius;
 
   // Set the smoothing_radius and model radius 
-  h = (particle_spacing < 0.8) ? particle_spacing * alpha : 1.2;
-  // artificially lower smoothing radius as a test 
-  // h /= 2.5;
-  radius = 0.2 * h;
-  
-  // Create shape meshes
-  mesh::Sphere_GL sphere_gl(40, 40, radius);
-  mesh::Cube_GL cube_gl(cube_size);
 
+  // Create shape meshes
   // Container defn
   std::vector<float> container(3, cube_size);
+
+  h = 1.2 * (pow(static_cast<float>(container[0] * container[1] * container[2] / particle_count), 1.0/3.0));
+  std::cout << "Smoothing Radius: " << h << '\n';
+
+  radius = 0.1 * h;
+  mesh::Sphere_GL sphere_gl(40, 40, radius);
+  mesh::Cube_GL cube_gl(cube_size);
 
   // Initialize the simulation
   uint32_t partition_count = 0;
@@ -66,12 +66,7 @@ int main(int argc, char *argv[])
   float *u_positions = nullptr;
   float *u_densities = nullptr;
 
-  uint32_t list_size;
-
   initOffsetTable();
-
-  neighborList *list;
-  list = initNeighborList(&list_size, particle_count);
 
   // Call to initialization
   initalizeSimulation(
@@ -103,9 +98,7 @@ int main(int argc, char *argv[])
 
     // Update Position State
     particleIterator(
-      list,
       d_objs_,
-      &list_size,
       &u_positions,
       &u_densities,
       d_lookup_,

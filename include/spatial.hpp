@@ -13,7 +13,7 @@
 #include <iostream>
 #include <cstdint>
 
-#define tol 1e-4
+#define tol 1e-5
 
 /**
  * Single entry into key/id paired table
@@ -95,7 +95,7 @@ class particleContainer {
       }
 
       // Handle 1D vectors
-      u_mass[i] = 1.0;
+      u_mass[i] = 0.954;
       u_dens[i] = tol;
       u_pr[i]   = 0.0;
     }
@@ -146,7 +146,7 @@ class particleContainer {
         u_visf[idx] = 0.0;
       }
 
-      u_mass[i] = 1.0;
+      u_mass[i] = tol;
       u_dens[i] = tol;
       u_pr[i]   = 0.0;
     }
@@ -177,6 +177,12 @@ class particleContainer {
 /* Function prototypes */
 
 __host__ void setGridSize(uint32_t *blocks, uint32_t *threads, uint32_t arr_size);
+
+template <typename T>
+bool isPrime(T val);
+
+template <typename T>
+void convertToPrime(T *val);
 
 template <typename T>
 T min(const std::vector<T>& vec);

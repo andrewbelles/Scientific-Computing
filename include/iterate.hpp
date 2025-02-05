@@ -11,9 +11,7 @@
 #include <driver_types.h>
 
 __host__ void particleIterator(
-  neighborList *list,
   particleContainer *d_objs_,
-  uint32_t *list_size,
   float **u_positions,
   float **u_densities,
   Lookup *d_lookup_,
