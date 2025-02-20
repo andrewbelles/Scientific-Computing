@@ -1,8 +1,18 @@
 import matplotlib.pyplot as plt 
 import numpy as np 
-import re
+import argparse 
 
-def process_test_data(path):
+def process_1d_data(path):
+
+    data = []
+
+    with open(path, "r", encoding='utf-8') as file_object:
+        for line in file_object:
+            x = float(line.strip())
+            data.append(x)
+    return np.array(data)
+
+def process_2d_data(path):
 
     data = []
 
@@ -11,22 +21,35 @@ def process_test_data(path):
 
             x, y = map(float, line.split(','))
             data.append([x, y])
+    return np.array(data)
 
-    vec = np.array(data)
-    return vec
-
-def plot_test_data(vec): 
-
-    x = vec[:, 0]
-    y = vec[:, 1]
+def plot_test_data(x, y, title="Data Plot"): 
 
     plt.scatter(x, y)
-    plt.xlabel("Time [0:2pi]")
+    plt.xlabel("Time [0:20*pi]")
     plt.ylabel("Amplitude")
-    plt.title("Randomized Data")
-    plt.savefig("randomized_data.png")
+    plt.title(title)
+    plt.savefig(title + ".png")
+    plt.close()
 
-path = "output.txt"
-vec = process_test_data(path)
-plot_test_data(vec)
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", type=str, required=True, help="Epoch File")
 
+    args = parser.parse_args()
+
+    input_path = "test_data.txt"
+    epoch_data = "output_files/" + args.input
+
+    # Vec is the input and expected output
+    vec    = process_2d_data(input_path)
+    output = process_1d_data(epoch_data)
+
+    # Grab inputs 
+    inputs = vec[:, 0]
+
+    title = args.input
+    plot_test_data(inputs, output, title)
+
+if __name__ == "__main__":
+    main()

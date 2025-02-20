@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::{self, BufReader, BufRead, Write};
+use std::path::PathBuf;
 use std::env;
 use std::f64::consts::PI;
 use rand::distr::{Uniform, Distribution};
@@ -147,7 +148,9 @@ pub trait Matmul { fn mul(&mut self, matrix: &Matrix) -> Option<Matrix>; }
 impl Matmul for Matrix {
     fn mul(&mut self, matrix: &Matrix) -> Option<Matrix> {
         match self.col == matrix.row {
-            false => return None,   // Only can return none if sizes are invalid 
+            false => {
+                panic!("Matmul Size Mismatch: {}x{} x {}x{}", self.row, self.col, matrix.row, matrix.col);
+            },   // Only can return none if sizes are invalid 
             true  => {
                 // Sizes match proceed with naive matmul
                 let mut result = Matrix::new(0.0, self.row, matrix.col);
@@ -219,7 +222,7 @@ impl Transpose for Matrix {
 pub trait MLOperations {
     fn hadamard(&self, matrix: &Matrix) -> Matrix;
     fn mean(&self) -> f64;
-    fn apply_derivation(&mut self, func: fn(f64) -> f64);
+    fn apply_derivative(&mut self, func: fn(f64) -> f64);
 }
 impl MLOperations for Matrix {
     // Multiply every data value in self with derivative matrix 
@@ -239,7 +242,7 @@ impl MLOperations for Matrix {
     fn mean(&self) -> f64 {
         self.data.iter().sum::<f64>() / ((self.row * self.col) as f64)
     }
-    fn apply_derivation(&mut self, func: fn(f64) -> f64) {
+    fn apply_derivative(&mut self, func: fn(f64) -> f64) {
         for i in 0..self.row {
             for j in 0..self.col {
                 self.data[i * self.col + j] = func(self.data[i * self.col + j]);
@@ -283,8 +286,10 @@ impl InstantiateNeuronMatrix for NeuronMatrix {
     // Sizes 0 is input count; Sizes 1 is output size 
     fn initialize(&mut self, sizes: &[usize; 2]) {
         // Calculate uniform distribution for input output size 
+
         //let uniform_range: f64 = (6.0 / ((sizes[0] + sizes[1]) as f64)).sqrt();
-        let uniform_range: f64 = (2.0 / (sizes[0] as f64)).sqrt(); 
+        //let uniform_range: f64 = (2.0 / (sizes[0] as f64)).sqrt(); 
+        let uniform_range: f64 = (1.0 / (sizes[0] as f64)).sqrt();
 
         let uniform = Uniform::new_inclusive(-uniform_range, uniform_range).expect("failure");
         let mut rng = rand::rng();
@@ -340,7 +345,8 @@ impl InstantiateNetwork for Network {
 
         // Start at 2nd hidden layer 
         for i in 1..hidden_ct {
-            let prev_input = neuron_counts[i];
+            let prev_input = neuron_counts[i - 1];
+            println!("Prev Count {}", prev_input);
             
             // Initialize weights and biasees for ith layer
             let mut layer = NeuronMatrix::new(neuron_counts[i], prev_input);
@@ -431,48 +437,41 @@ impl Forward for Network {
 pub trait Backward { fn backward(&mut self, expected: &Matrix , learning_rate: f64, func: fn(f64) -> f64); }
 impl Backward for Network {
     fn backward(&mut self, expected: &Matrix, learning_rate: f64, func: fn(f64) -> f64) {
-        
+        // Copy intermediate value of delta and collect gradient of cost function a_L - y  
         let mut delta = self.activations.last().unwrap().clone();
-        // delta.print();
-        delta.sub(expected);
+        delta.sub(&expected);
 
-        // Starting from the last 
-        for (i, layer) in self.layers.iter_mut().enumerate().rev() {
-            // Collect current activation value 
-            let activation = &self.activations[self.activations.len() - i - 2];
+        for i in 0..self.layer_count {
+            // println!("Current Iteration: {i}"); 
+            let current_layer_index = self.layer_count - i - 1;
+            let activation_index    = current_layer_index + 1;
 
-            // Apply derivative to activation
-            let mut derivative = activation.clone();
-            derivative.apply_derivation(func);
+            // Find f'(a_i)
+            let mut derivative = self.activations[activation_index].clone();
+            derivative.apply_derivative(func);
 
-            assert_eq!(delta.row, derivative.row, "{i}th enum. {}x{} and {}x{}",
-                delta.row, delta.col,
-                derivative.row, derivative.col
-            );
-            assert_eq!(delta.col, derivative.col, "{i}th enum. {}x{} and {}x{}",
-                delta.row, delta.col,
-                derivative.row, derivative.col
-            );
-
-            // Update delta  
-            delta = delta.hadamard(&derivative);
-            
-            let mut activation_transpose = activation.clone();
-            activation_transpose.transpose();
-            let mut grad_weights = activation_transpose.mul(&delta).unwrap();
-
-            // Update Weights
-            layer.weights().sub(&grad_weights.scale(learning_rate));
-            // Update Biases 
-            let grad_biases = delta.mean() * learning_rate;
-            layer.biases().data.iter_mut().for_each(|b| *b -= grad_biases);
-
-            // Propagate Error Backward
-            if i > 0 { 
-                let mut weights_transpose = layer.weights().clone();
-                weights_transpose.transpose();
-                delta = delta.mul(&weights_transpose).unwrap();
+            if i != 0 {
+                let mut weight_c = self.layers[current_layer_index + 1].weights().clone();
+                weight_c.transpose();
+                // Update delta from (W_i+1)^T x delta_i+1
+                delta = delta.mul(&weight_c).unwrap();
             }
+
+            // println!("Hadamard Product");
+            // find true next delta through hadamard 
+            delta = delta.hadamard(&derivative);
+
+            // Cost function: Input for layer (previous output or i - 2)
+            let mut activation_c = self.activations[current_layer_index].clone();
+            activation_c.transpose();
+            // println!("Compute Weight Gradient");
+            let mut weight_gradient = activation_c.mul(&delta).unwrap();
+            // println!("Compute Bias Gradient");
+            let mut bias_gradient   = Matrix::new(delta.mean(), delta.row, delta.col);
+
+            // println!("Compute New Weights and Biases for Layer");
+            self.layers[current_layer_index].weights().sub(&weight_gradient.scale(learning_rate));
+            self.layers[current_layer_index].biases().sub(&bias_gradient.scale(learning_rate));
         }
     }
 }
@@ -519,6 +518,45 @@ pub fn string_to_int(arg: &str) -> Option<usize> {
     }
 }
 
+// Parses [a, b, c, etc] into the counts
+pub fn parse_counts(arg: &str) -> Option<Vec<usize>> {
+    if !arg.starts_with('[') || !arg.ends_with(']') {
+        return None
+    }
+
+    let arg_tr = arg.trim_start_matches('[').trim_end_matches(']');
+    if arg_tr.is_empty() {
+        return Some(Vec::new())
+    }
+
+    let counts: Result<Vec<usize>, _> = arg_tr
+        .split(',')
+        .map(|count_str| {
+            count_str.trim().parse::<usize>().map_err(|_| {
+                "Parse Failure!".to_string()
+        })
+    }).collect();
+
+    match counts {
+        Ok(vec) => Some(vec),
+        Err(_) => None
+    }
+}
+
+pub fn save_epoch_output(epoch: usize, data: Vec<f64>) -> io::Result<()> {
+    
+    let filename = format!("epoch_{:04}.txt", epoch);
+    let mut path = PathBuf::from("./output_files");
+    path.push(filename);
+
+    let mut file = File::create(&path)?;
+    for i in 0..data.len() {
+        writeln!(file, "{}", data[i])?;
+    }
+
+    Ok(())
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
 
@@ -539,12 +577,12 @@ fn main() -> io::Result<()> {
                     writeln!(&mut file, ",{}", y)?;
                 }
             } else {
-                panic!("Invalid Arguments. Usage: [cargo run] [gen] [size=] [ampl=] [perc=] [sparse_data.txt]");
+                panic!("Invalid Arguments. Usage: [cargo run] [gen] [size=] [ampl=] [sparse_data.txt]");
             }
         },
         _ => {
-            if args.len() != 3 {
-                eprintln!("Invalid Arguments Usage: [cargo] [sparse/training_data.txt] [t/s]");
+            if args.len() != 4 {
+                eprintln!("Invalid Arguments Usage: [cargo run] [sparse/training_data.txt] [counts] [t/s]");
                 eprintln!("Alternative: [cargo run] [gen] [size=] [ampl=] [sparse_data.txt]");
                 return Ok(());
             }
@@ -552,6 +590,8 @@ fn main() -> io::Result<()> {
     }
 
     let input_path = &args[1];
+    let count_arg = &args[2];
+    let counts = parse_counts(count_arg).unwrap();
     // let mode       = &args[2];
 
     // Read data into array
@@ -583,7 +623,7 @@ fn main() -> io::Result<()> {
 
     // pass data to the matching call -t or -o
     // -o also needs to pull the weights.txt file
-    let use_arg = &args[2];
+    let use_arg = &args[3];
     if use_arg == "-t" {
 
         let size = data.len();
@@ -601,25 +641,29 @@ fn main() -> io::Result<()> {
 
         expected.fill(&expect_vec);
         input_data.fill(&input_vec);
-            
-        // Make example network.
-        let counts = vec![8];      // Only one hidden layer
-        let mut network = Network::new(1, 1, counts);
 
-        let learning_rate = 5e-8;
+        // Make example network.
+        
+        let mut network = Network::new(1, 1, counts);
+        println!("Size {:?}", network.sizes);
+
+        let learning_rate = 1e-3;
         let epochs = 1000;
 
         for epoch in 0..epochs {
-            let mut output = network.forward(&mut input_data, rectified_linear_unit);
+            let mut output = network.forward(&mut input_data, |x| x.tanh() );
 
             let loss_matrix = output.sub(&expected);
             let loss = loss_matrix.data.iter().map(|x| x.powi(2)).sum::<f64>() / (size as f64);
         
-            network.backward(&expected, learning_rate, relu_derivative);
+            network.backward(&expected, learning_rate, |x| 1.0 - x.tanh().powi(2));
 
             if epoch % 1 == 0 {
                 println!("Epoch {} Loss {}", epoch, loss);
             }
+            
+            // Save data into output_files
+            save_epoch_output(epoch, output.data).unwrap();
         }
 
         let mut file = File::create("weights.txt")?;
@@ -686,14 +730,14 @@ fn main() -> io::Result<()> {
         }
         let mut input_matrix = Matrix::new(0.0, 10000, 1);
         input_matrix.fill(&inputs);
-        let output = network.forward(&mut input_matrix, rectified_linear_unit);
+        let output = network.forward(&mut input_matrix, leaky_relu);
 
         let mut data: Vec<[f64; 2]> = Vec::new();
         for i in 0..10000 {
             data.push([inputs[i], output.data[i]]);
         }
 
-        let mut file = File::create("output.txt")?;
+        let mut file = File::create("./prediction/output.txt")?;
         let values = &data[..];
         for [x,y] in values.iter() {
             write!(&mut file, "{}", x)?;
