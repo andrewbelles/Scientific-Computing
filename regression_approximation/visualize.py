@@ -38,7 +38,7 @@ def main():
 
     args = parser.parse_args()
 
-    input_path = "test_data.txt"
+    input_path = "sparse_test.txt"
     epoch_data = "output_files/" + args.input
 
     # Vec is the input and expected output
@@ -46,10 +46,12 @@ def main():
     output = process_1d_data(epoch_data)
 
     # Grab inputs 
-    inputs = vec[:, 0]
+    inputs   = vec[:, 0]
+    expected = vec[:, 1]
 
     title = args.input
     plot_test_data(inputs, output, title)
+    plot_test_data(inputs, output, "expected_output")
 
 if __name__ == "__main__":
     main()

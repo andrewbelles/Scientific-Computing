@@ -5,6 +5,9 @@ use std::env;
 use std::f64::consts::PI;
 use rand::distr::{Uniform, Distribution};
 
+mod rewrite;
+
+
 // Simple matrix class that encloses data in 2D flattened vector (to 1D)
 #[derive(Clone)]
 pub struct Matrix {
@@ -579,6 +582,7 @@ fn main() -> io::Result<()> {
             } else {
                 panic!("Invalid Arguments. Usage: [cargo run] [gen] [size=] [ampl=] [sparse_data.txt]");
             }
+            return Ok(())
         },
         _ => {
             if args.len() != 4 {
