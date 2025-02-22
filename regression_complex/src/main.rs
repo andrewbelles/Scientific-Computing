@@ -13,9 +13,55 @@ use rand::distr::{Uniform, Distribution};
 
 // MATRIX OPERATIONS AND LAYER/NETWORK CREATION/USAGE
 
+#[derive(Clone)]
 pub struct FunctionFamily {
     function: fn(f64) -> f64,
     derivative: fn(f64) -> f64,
+}
+
+pub struct Tanh;
+pub struct Sin;
+pub struct LeakyReLu {
+    pub alpha: f64,
+}
+
+pub trait ActivationFunction { fn get_function() -> FunctionFamily; }
+impl ActivationFunction for Tanh {
+    fn get_function() -> FunctionFamily {
+        FunctionFamily {
+            function: |x| x.tanh(),
+            derivative: |x| 1.0 - x.tanh().powi(2),
+        }
+    }
+}
+impl ActivationFunction for Sin {
+    fn get_function() -> FunctionFamily {
+        FunctionFamily {
+            function: |x| x.sin(),
+            derivative: |x| x.cos(),
+        }
+    }
+}
+
+impl ActivationFunction for LeakyReLu {
+    fn get_function() -> FunctionFamily {
+        FunctionFamily {
+            function: |x| {
+                if x > 0.0 {
+                    x
+                } else {
+                    0.01 * x
+                }
+            },
+            derivative: |x| {
+                if x > 0.0 {
+                    1.0
+                } else {
+                    0.01
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -77,7 +123,7 @@ pub trait MatrixOperations{
     fn sub(&self, matrix: &Matrix) -> Option<Matrix>;
     fn mul(&self, matrix: &Matrix) -> Option<Matrix>;
     fn mean(&self) -> f64;
-    fn col_mean(&self) -> Matrix;
+    fn stdev(&self, mean: &mut f64) -> f64;
 }
 impl MatrixOperations for Matrix {
     // Scale matrix by some scalar value 
@@ -208,16 +254,18 @@ impl MatrixOperations for Matrix {
         sum /= (self.row * self.col) as f64;
         sum
     }
-    fn col_mean(&self) -> Matrix {
-        let mut result = Matrix::new(0.0, 1, self.col);
-
-        for i in 0..self.col {
-            for j in 0..self.row {
-                result.data[i] += self.data[j * self.col + i];
-            }
-            result.data[i] /= self.row as f64;
+    fn stdev(&self, mean: &mut f64) -> f64 {
+        if *mean == 0.0 {
+            *mean = self.mean();
         }
-        result
+
+        let mut residual_sum: f64 = 0.0;
+        for i in 0..self.row {
+            for j in 0..self.col {
+                residual_sum += (self.data[i * self.col + j] - *mean).powi(2); 
+            }
+        }
+        ((residual_sum) / (self.row * self.col - 1) as f64).sqrt()
     }
 }
 
@@ -258,15 +306,16 @@ impl MachineLearningOperations for Matrix {
 pub struct Layer {
     weights: Matrix,
     biases: Matrix,
+    func: FunctionFamily
 }
 
 pub trait InstantiateLayer {
-    fn new(neuron_count: usize, prev_input_count: usize) -> Layer;
+    fn new(neuron_count: usize, prev_input_count: usize, funcs: FunctionFamily) -> Layer;
 }
 impl InstantiateLayer for Layer {
-    fn new(neuron_count: usize, prev_input_count: usize) -> Layer {
+    fn new(neuron_count: usize, prev_input_count: usize, funcs: FunctionFamily) -> Layer {
         // Create uniform distribution to sample from. Xavier Weight Initialization  
-        let uniform_range: f64 = (1.0 / (prev_input_count as f64)).sqrt();
+        let uniform_range: f64 = (2.0 / ((neuron_count + prev_input_count) as f64)).sqrt();
         let uniform = Uniform::new_inclusive(-uniform_range, uniform_range).unwrap();
         let mut rng = rand::rng();
 
@@ -281,7 +330,7 @@ impl InstantiateLayer for Layer {
         // Initlize biases to small nonzero value  
         let biases = Matrix::new(0.01, 1, neuron_count);
 
-        Layer { weights, biases }
+        Layer { weights, biases, func: funcs }
     }
 }
 
@@ -291,29 +340,28 @@ pub struct Network {
     activations: Vec<Matrix>,
     sizes: Vec<[usize; 2]>,
     layer_count: usize,
-    functions: FunctionFamily
 }
 
 // Counts holds the number of neurons for each layer which is used to map each matrix as connecting 
 //
 // counts.first() and counts.last() hold the Input and Output Count respectively to simplify logic
-pub trait InstantiateNetwork { fn new(counts: &Vec<usize>, funcs: FunctionFamily) -> Network; }
+pub trait InstantiateNetwork { fn new(counts: &Vec<usize>, funcs: Vec<FunctionFamily>) -> Network; }
 impl InstantiateNetwork for Network {
-    fn new(counts: &Vec<usize>, funcs: FunctionFamily) -> Network {
+    fn new(counts: &Vec<usize>, funcs: Vec<FunctionFamily>) -> Network {
         let layer_count  = counts.len() - 1;
         let mut new_layers: Vec<Layer> = Vec::new();
         let activations: Vec<Matrix>   = Vec::with_capacity(layer_count + 1);   // Create with +1
         let mut new_sizes: Vec<[usize; 2]> = Vec::new();
 
         // Create each layer using input counts 
-        for i in 1..=layer_count {
+        for i in 0..layer_count {
             // Set Layer depending on first hidden or any subsequent
-            let new_layer = Layer::new(counts[i], counts[i - 1]);
-            new_sizes.push([counts[i - 1], counts[i]]);
+            let new_layer = Layer::new(counts[i + 1], counts[i], funcs[i].clone());
+            new_sizes.push([counts[i], counts[i + 1]]);
             new_layers.push(new_layer);
         }
         // Return new network
-        Network { layers: new_layers, activations, sizes: new_sizes, layer_count, functions: funcs }
+        Network { layers: new_layers, activations, sizes: new_sizes, layer_count }
     }
 }
 
@@ -333,7 +381,7 @@ impl ForwardPropagation for Network {
             z = z.add(&layer.biases).unwrap();
             
             if i != self.layer_count - 1 {
-                z = z.activate(self.functions.function);
+                z = z.activate(layer.func.function);
             }
             
             // Add to activations vector
@@ -357,7 +405,7 @@ impl BackwardPropagation for Network {
 
             // Find f'(a_l)
             let mut derivative = self.activations[activation_index].clone();
-            derivative = derivative.activate(self.functions.derivative);
+            derivative = derivative.activate(self.layers[layer_index].func.derivative);
             
             // Find next Cost with respect to activation
             if i != 0 {
@@ -385,7 +433,9 @@ impl BackwardPropagation for Network {
 
             // Scale each by learning rate 
             weight_gradient = weight_gradient.scale(learning_rate);
+            // weight_gradient.print();
             bias_gradient   = bias_gradient.scale(learning_rate);
+            // bias_gradient.print();
 
             // Update weights and biases 
             let weights = self.layers[layer_index].weights.sub(&weight_gradient).unwrap();
@@ -476,10 +526,10 @@ pub fn save_weights(network: &Network) -> io::Result<()> {
 }
 
 // Runs full training of network to n iterations. Takes ownership of Network (Not a borrow)
-pub fn training_loop(mut network: Network, input_matrix: &Matrix, expected_matrix: &Matrix) {
-    let mut inputs   = input_matrix.clone();
-    let expected     = expected_matrix.clone(); 
-    let learning_rate = 1e-4;
+pub fn training_loop(mut network: Network, min: &f64, max: &f64, sinput_matrix: &Matrix, sexpected_matrix: &Matrix) {
+    let mut inputs   = sinput_matrix.clone();
+    let expected     = sexpected_matrix.clone(); 
+    let learning_rate = 1e-5;
     let epochs        = 1000;
 
     // Loop over all epochs.
@@ -497,7 +547,8 @@ pub fn training_loop(mut network: Network, input_matrix: &Matrix, expected_matri
         println!("Epoch {} Loss {}", epoch, loss);
 
         // Save epoch data to file 
-        let _ = save_epoch_output(&epoch, &output.data);
+        let unscaled_output = reverse_normalize(&output, min, max);
+        let _ = save_epoch_output(&epoch, &unscaled_output.data);
     }
 }
 
@@ -529,6 +580,45 @@ pub fn predict_output(mut network: Network) -> io::Result<()> {
     Ok(())
 }
 
+pub fn get_min_max(matrix: &Matrix) -> (f64, f64) {
+    let mut min = matrix.data[0];
+    let mut max = matrix.data[0];
+
+    for &value in matrix.data.iter() {
+        if value < min {
+            min = value;
+        } else if value > max {
+            max = value;
+        }
+    }
+    
+    (min, max)
+}
+
+// Normalize data to [-1, 1]
+pub fn normalize_input(input_matrix: &Matrix) -> Matrix {
+    let (min, max) = get_min_max(&input_matrix);
+    
+    let mut scaled_inputs = Matrix::new(0.0, input_matrix.row, input_matrix.col);
+    for i in 0..input_matrix.row {
+        for j in 0..input_matrix.col {
+            scaled_inputs.data[i * input_matrix.col + j] = 2.0 * (input_matrix.data[i * input_matrix.col + j] - min) / (max - min) - 1.0;
+        }
+    }
+
+    scaled_inputs
+}
+
+pub fn reverse_normalize(scaled_input: &Matrix, min: &f64, max: &f64) -> Matrix {
+    let mut unscaled = Matrix::new(0.0, scaled_input.row, scaled_input.col);
+    for i in 0..scaled_input.row {
+        for j in 0..scaled_input.col {
+            unscaled.data[i * scaled_input.col + j] = ( scaled_input.data[i * scaled_input.col + j] + 1.0 ) * (max - min) / 2.0 + min;
+        }
+    }
+    unscaled
+}
+
 fn main() -> io::Result<()> {
     // Link input and output count into neuron count
     // S.t a cmd line input [1,32,16,8,1] means SISO 1x32, 32x16, 16x8 network
@@ -545,11 +635,6 @@ fn main() -> io::Result<()> {
     //    I want to shift to using a python script to generate test data so we can remove the logic
     
     let args: Vec<String> = env::args().collect();
-    let functions = FunctionFamily {
-        function: |x| x.tanh(),
-        derivative: |x| 1.0 - x.tanh().powi(2)
-    };
-
 
     // Expected inputs:
     //   cargo run data.txt [a,b,c,etc] -t          -- 3 args
@@ -575,6 +660,11 @@ fn main() -> io::Result<()> {
             
             let pulled_counts = pulled_counts.unwrap();
             let counts = pulled_counts.clone();
+
+            let mut functions: Vec<FunctionFamily> = Vec::new();
+            for _ in 0..counts.len() {
+                functions.push(Tanh::get_function());
+            }
 
             let mut network = Network::new(&counts, functions);
 
@@ -604,6 +694,11 @@ fn main() -> io::Result<()> {
             // Parse counts and clone
             let counts = parse_counts(&count_arg).unwrap();
             let network_size = counts.clone();
+
+            let mut functions: Vec<FunctionFamily> = Vec::new();
+            for _ in 0..counts.len() {
+                functions.push(Tanh::get_function());
+            }
 
             let file   = File::open(file_arg)?;
             let reader = BufReader::new(file);
@@ -652,10 +747,14 @@ fn main() -> io::Result<()> {
             inputs.fill(&inputs_vec);
             outputs.fill(&outputs_vec);
 
+            // Scale to range -1 to 1 
+            let scaled_inputs = normalize_input(&inputs);
+            let scaled_expected = normalize_input(&outputs);
+            let (omin, omax) = get_min_max(&outputs);
             // Create network and call training loop 
             let network = Network::new(&network_size, functions);
             println!("{:?}", network.sizes);
-            training_loop(network, &inputs, &outputs);
+            training_loop(network, &omin, &omax, &scaled_inputs, &scaled_expected);
         },
         _ => {
             panic!("Invalid! Usage: [cargo run] [data/weights.txt] [-t/p] [counts (if -t)]");

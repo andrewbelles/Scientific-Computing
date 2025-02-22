@@ -28,7 +28,7 @@ def plot_test_data(x, y, title="Data Plot"):
     print(title)
 
     plt.scatter(x, y)
-    plt.xlabel("Time [0:20*pi]")
+    plt.xlabel("Time [0:10]")
     plt.ylabel("Amplitude")
     plt.title(title)
     plt.savefig(title + ".png")
