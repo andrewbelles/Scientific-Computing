@@ -1,6 +1,6 @@
 use std::io::{self, BufReader, BufRead, Write};
 use std::fs::File;
-use std::ops::Add;
+use std::ops::{Add, Sub};
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 struct Coordinate {
@@ -16,6 +16,16 @@ impl Add for Coordinate {
             x: self.x + other.x,
             y: self.y + other.y
         }
+    }
+}
+impl Sub for Coordinate {
+    type Output = Self;
+
+    fn sub(self, other: Coordinate) -> Self {
+        Coordinate {
+            x: self.x - other.x,
+            y: self.y - other.y,
+        } 
     }
 }
 
@@ -43,6 +53,12 @@ impl Coordinate {
     }
     fn average(self) -> f64 {
         (self.x + self.y) / 2.0
+    }
+    fn to_degrees(self) -> Self {
+        Coordinate {
+            x: self.x.to_degrees(),
+            y: self.y.to_degrees()
+        }
     }
 }
 
@@ -107,7 +123,7 @@ impl Object {
 
 trait NumericTools {
     fn ground_linear_interpolate(&self, coordinate: &Coordinate) -> Coordinate;
-    fn resolve_boundary_condition(&mut self, next: &mut Coordinate, bound: &Coordinate) -> f64;
+    fn resolve_boundary_condition(&mut self, next: &mut Coordinate, next_vel: &mut Coordinate, bound: &Coordinate) -> bool;
     fn acceleration(&self, intermediate_velocity: &Coordinate) -> Coordinate;
 }
 impl NumericTools for Object {
@@ -115,35 +131,33 @@ impl NumericTools for Object {
         let x = self.pos.x + (0.0 - self.pos.y) * (next.x - self.pos.x) / (next.y - self.pos.y);
         Coordinate { x, y: 0.0 }
     }
-    fn resolve_boundary_condition(&mut self, next: &mut Coordinate, bound: &Coordinate) -> f64 {
+    fn resolve_boundary_condition(&mut self, next: &mut Coordinate, next_vel: &mut Coordinate, bound: &Coordinate) -> bool {
         // Determine the direction that the object is potentially colliding from 
         // Check if self and next are both to right or left of boundary condition
 
-
-        if (self.pos.x - bound.x) * (next.x - bound.x) > 0.0 {
-            return self.vel.x
+        if (self.pos.x - bound.x) * (next.x - bound.x) >= 0.0 {
+            return false 
         }
-
-        let real_bound = if self.pos.x < bound.x {
-            bound.x - self.tol 
-        } else {
-            bound.x + self.tol
-        };
 
         // Find interpolated y value through barrier
-        let ratio = (real_bound - self.pos.x) / (next.x - self.pos.x);
+        let ratio = (bound.x - self.pos.x) / (next.x - self.pos.x);
         let y_i =  self.pos.y + (next.y - self.pos.y) / ratio;
 
-        // println!("{:?}", self.vel);
         // Check if value clears the barrier
         if y_i > bound.y + self.tol {
-            return self.vel.x
+            return false
         }
-        // println!("Between y_i {} and y_i+1 {} Interpolated y_int {y_i}", self.pos.y, next.y);
+
+        let dt_i = ratio * self.dt;
 
         // Return interpolated coordinate 
-        *next = Coordinate { x: real_bound, y: y_i };
-        return self.vel.x * -1.0;
+        *next = Coordinate { x: bound.x, y: y_i };
+
+        let a = self.acceleration(next_vel);
+        *next_vel = *next_vel + a.scale(&dt_i);
+        next_vel.x *= -1.0;
+
+        return true
         // println!(">> Collision!\n>> Collision!\n {:?}", self.vel);
     }
     fn acceleration(&self, intermediate_velocity: &Coordinate) -> Coordinate {
@@ -165,11 +179,11 @@ impl NumericTools for Object {
 }
 
 trait NumericMethods {
-    fn runge_kutta(&mut self, angle: &f64) -> Vec<Coordinate>;
-    fn euler(&mut self, angle: &f64) -> Vec<Coordinate>;
+    fn runge_kutta(&mut self, angle: &f64, screen: bool) -> (Vec<Coordinate>, bool, bool);
+    //fn euler(&mut self, angle: &f64) -> Vec<Coordinate>;
 }
 impl NumericMethods for Object {
-    fn runge_kutta(self: &mut Object, angle: &f64) -> Vec<Coordinate> {
+    fn runge_kutta(self: &mut Object, angle: &f64, screen: bool) -> (Vec<Coordinate>, bool, bool) {
         // Clear previous position and velocity values
         self.pos.clear(); 
         self.vel.resolve(&self.v_i, angle); 
@@ -177,6 +191,8 @@ impl NumericMethods for Object {
         // Make copy of boundary conditions 
         let screen_bound = Coordinate { x: self.d_s, y: self.h_s };
         let wall_bound   = Coordinate { x: self.d_w, y: self.h_w };
+        let mut _display = true;
+        let mut hit = false;
 
         // Set position vector 
         let mut positive = true;
@@ -206,14 +222,33 @@ impl NumericMethods for Object {
 
             // Iterate position and velocity
             let mut next = self.pos + velocity_weighted_sum.scale(&self.dt);
+
+            /*if hit {
+                println!("Current Pos:   {:?}", self.pos);
+                println!("Next Position: {:?}", next);
+            }*/
+
             // println!("{}", next.x - self.pos.x);
-            self.vel = self.vel + accel_weighted_sum.scale(&self.dt);
+            let mut next_vel = self.vel + accel_weighted_sum.scale(&self.dt);
 
             // Check for screen collision 
-            self.vel.x = self.resolve_boundary_condition(&mut next, &screen_bound); 
+            if screen == true {
+                let screen_hit = self.resolve_boundary_condition(&mut next, &mut next_vel, &screen_bound); 
+                if screen_hit { 
+                    return (positions, hit, true)
+                }
+            }
+                /*if hit && display {
+                println!("Velocity: {:?}", self.vel);
+                display = false;
+            }*/
             //println!("Velocity: {:?}", self.vel); 
             // Check for wall collision 
-            self.vel.x = self.resolve_boundary_condition(&mut next, &wall_bound);
+            let local_hit = self.resolve_boundary_condition(&mut next, &mut next_vel, &wall_bound);
+            if local_hit {
+                //println!("HIT BACK WALL");
+                hit = true;
+            }
 
             // Check if intersecting with ground; if so rectify through interpolation and return
             if next.y <= self.tol && self.vel.y < 0.0 {
@@ -223,11 +258,13 @@ impl NumericMethods for Object {
             // println!("Position {:?}", next);
             // Add position to vector 
             self.pos = next;
+            self.vel = next_vel;
             positions.push(self.pos)
         }
-        positions
+        // println!("{:?}", hit);
+        (positions, hit, false)
     }
-    fn euler(&mut self, angle: &f64) -> Vec<Coordinate> {
+    /*fn euler(&mut self, angle: &f64) -> Vec<Coordinate> {
         // Clear pos and get velocity for angle
         self.pos.clear(); 
         self.vel.resolve(&self.v_i, angle); 
@@ -259,16 +296,16 @@ impl NumericMethods for Object {
             positions.push(self.pos)
         }
         positions
-    }
+    }*/
 }
 
 struct Trajectory {
     object: Object,
-    method: fn(&mut Object, &f64) -> Vec<Coordinate> 
+    method: fn(&mut Object, &f64, bool) -> (Vec<Coordinate>, bool, bool)
 }
 
 impl Trajectory {
-    fn new(object: Object, method: fn(&mut Object, &f64) -> Vec<Coordinate> ) -> Trajectory {
+    fn new(object: Object, method: fn(&mut Object, &f64, bool) -> (Vec<Coordinate>, bool, bool) ) -> Trajectory {
         Trajectory {
            object, 
            method
@@ -278,83 +315,159 @@ impl Trajectory {
 
 
 impl Trajectory {
-    // Increase bounds by one until valid
     fn set_bounds(&mut self, angle_bounds: &mut Coordinate, bounds: &mut Coordinate) {
-        bounds.x = (self.method)(&mut self.object, &angle_bounds.x).last().unwrap().x;
-        bounds.y = (self.method)(&mut self.object, &angle_bounds.y).last().unwrap().x;
+        let (result, _, _) = (self.method)(&mut self.object, &angle_bounds.x, false);
+        bounds.x = result.last().unwrap().x;
 
-        println!("Bounds [{}, {}]", bounds.x, bounds.y);
+        let (result, _, _) = (self.method)(&mut self.object, &angle_bounds.y, false);
+        bounds.y = result.last().unwrap().x;
 
-        // While the bounds lie on the same side of the target (i.e. not bounding solution)
         while (bounds.x - self.object.targ) * (bounds.y - self.object.targ) > 0.0 {
-            angle_bounds.y += 1.0_f64.to_radians();
-            bounds.y = (self.method)(&mut self.object, &angle_bounds.y).last().unwrap().x;
-            // println!("Angle {}: Boundary Error: {}", angle_bounds.y, bounds.y - self.object.targ);
-        } 
+            angle_bounds.y += 1.0_f64.to_radians(); 
+            let (result, _, _) = (self.method)(&mut self.object, &angle_bounds.y, false);
+            bounds.y = result.last().unwrap().x;
+
+            if angle_bounds.y > 180.0_f64.to_radians() {
+                break;
+            }
+        }
+        let deg_angle = angle_bounds.y.to_degrees().ceil();
+        angle_bounds.y = deg_angle.to_radians();
     }
 }
 
 trait NumericSolution {
-    fn bisection(&mut self, angle_bounds: &mut Coordinate) -> (Vec<f64>, f64);
-    //fn secant() -> (Vec<f64>, f64);
+    fn bisection(&mut self, angle_bounds: &mut Coordinate) -> (Vec<Coordinate>, f64, bool);
 }
 // Both methods return the error vector 
 impl NumericSolution for Trajectory {
-    fn bisection(&mut self, angle_bounds: &mut Coordinate) -> (Vec<f64>, f64) {
+    fn bisection(&mut self, angle_bounds: &mut Coordinate) -> (Vec<Coordinate>, f64, bool) {
         // Copy angles locally 
-        let mut error: Vec<f64> = Vec::new();
+        let mut error: Vec<Coordinate> = Vec::new();
         let mut i = 0;
         let mut midpoint: f64 = 0.0;
 
         let mut searching = true;
-        while searching == true && i < 50 {
+        while searching == true && i < 30 {
             midpoint = angle_bounds.average(); 
-            let x_final = (self.method)(&mut self.object, &midpoint).last().unwrap().x;
+            let (result, hit_wall, _) = (self.method)(&mut self.object, &midpoint, false);
+            let x_final = result.last().unwrap().x;
+
             let current_error = x_final - self.object.targ;
-            error.push(current_error);
+            error.push(Coordinate { x: current_error, y: midpoint });
     
+            /*
+            Increasing angle overall decreases deflected angle 
+            A deflected angle that is < 0.0 the angle is too high so the overall
+            angle should be lowered
+
+            Likewise a deflected angle that is > 0.0 means the defl angle is too low.
+            Therefore the overall should be lowered
+            */            
             if current_error.abs() < self.object.tol {
                 searching = false;
-            } else if current_error > 0.0 {
-                angle_bounds.y = midpoint; 
+            } else if midpoint > 45.0 {
+                if hit_wall {
+                    if current_error < 0.0 {
+                        angle_bounds.y = midpoint;
+                    } else {
+                        angle_bounds.x = midpoint;
+                    }
+                } else { 
+                    if current_error > 0.0 {
+                        angle_bounds.y = midpoint; 
+                    } else {
+                        angle_bounds.x = midpoint;
+                    }
+                }
             } else {
-                angle_bounds.x = midpoint;
+                if hit_wall {
+                    if current_error < 0.0 {
+                        angle_bounds.y = midpoint;
+                    } else {
+                        angle_bounds.x = midpoint;
+                    }
+                } else { 
+                    if current_error < 0.0 {
+                        angle_bounds.y = midpoint; 
+                    } else {
+                        angle_bounds.x = midpoint;
+                    }
+                }
             }
 
-            println!("Iteration {i}; Error: {}; Angle: {}", error[i], midpoint.to_degrees());
+            //println!("Iteration {i}; Error: {}; Angle: {}", error[i], midpoint.to_degrees());
             i += 1;
+            if i == 20 {
+                return (error, midpoint, false)
+            }
         }
         
-        (error, midpoint)
+        (error, midpoint, true)
     }
-    /*fn secant() -> Vec<f64> {
-    
-    }*/
 }
 
 fn main() -> io::Result<()> {
     let input = "inputs1-3.txt".to_string();
     let object: Object = Object::new(input)?;
     println!("{:?}", object);
-    let mut calculator = Trajectory::new(object, Object::euler);
+    let mut calculator = Trajectory::new(object, Object::runge_kutta);
+    let mut solution_set: Vec<f64> = Vec::new();
 
-    let mut angle_bounds = Coordinate { x: 0.0_f64.to_radians(), y: 25.0_f64.to_radians() };
+    // Set initial bounds
+    let mut angle_bounds = Coordinate { x: 0.0_f64.to_radians(), y: 0.0_f64.to_radians() };
     let mut bounds = Coordinate { x: 0.0, y: 0.0 };
 
-    // Compute angular bounds for problem
-    calculator.set_bounds(&mut angle_bounds, &mut bounds);
+    // println!("Max Angle: {}", max_angle.to_degrees());
 
-    println!("Angle Bounds: {:?}", angle_bounds);
-    println!("Physical Bounds: {:?}", bounds);
+    // Fan over 0 to 180 to find all valid angles 
+    let mut last = false;
+    loop {
 
-    let (_, optimal_angle) = calculator.bisection(&mut angle_bounds);
+        // Set y bound greater than x bound
+        angle_bounds.y = (angle_bounds.x.to_degrees() + 2.0).to_radians();
+        calculator.set_bounds(&mut angle_bounds, &mut bounds);
+
+        println!("Angles: {:?}", angle_bounds.to_degrees());
+        
+        if angle_bounds.y > 180.0_f64.to_radians() {
+            angle_bounds.y = 180.0_f64.to_radians();
+            last = true;
+        }
+
+        let original_bounds: Coordinate = angle_bounds;
+        let (errors, optimal_angle, solution) = calculator.bisection(&mut angle_bounds);
+        if solution {
+            println!("Bounds: {:?}", bounds);
+            solution_set.push(optimal_angle.to_degrees());
+        }
+        // Print error regardless as a test
+        for value in errors {
+            print!("Error: {}, ", value.x);
+            println!("Angle: {}", value.y.to_degrees());
+        }
+        angle_bounds.x = original_bounds.y;
+        if last {
+            break;
+        }
+    }
+
+    // Force bounds within known successful range as a test
+    let mut angle_bounds = Coordinate { x: 0.0, y: 20.0_f64.to_radians() };
+
+    let (_, test, solution) = calculator.bisection(&mut angle_bounds);
+    if solution { println!("Test Angle: {}", test.to_degrees()); }
+
+    let (result, _, _) = calculator.object.runge_kutta(&(21.004848480224613_f64.to_radians()), false);
+    let x_final = result.last().unwrap().x;
+
+    println!("X from 14.898 deg: {x_final}");
+    println!("Solution Set: {:?}", solution_set);
     
-    println!("Optimal Angle {}", optimal_angle.to_degrees());
-    let results = calculator.object.euler(&optimal_angle.to_radians());
-
     let mut file = File::create("optimal_angle.txt")?;
-    for value in results {
-        writeln!(file, "{:?}", value)?;
+    for value in result {
+        write!(file, "{},", value.x)?;
+        writeln!(file, "{}", value.y)?;
     } 
 
     Ok(())
