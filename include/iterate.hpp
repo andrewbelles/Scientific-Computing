@@ -12,8 +12,8 @@
 
 __host__ void particleIterator(
   particleContainer *d_objs_,
-  float **u_positions,
-  float **u_densities,
+  float*& u_positions,
+  float*& u_densities,
   Lookup *d_lookup_,
   const std::vector<float> container,
   const uint32_t n_particles,

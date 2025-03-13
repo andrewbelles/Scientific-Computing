@@ -9,7 +9,7 @@ __global__ static void setAccumulators(particleContainer *d_objs_, uint32_t n_pa
   if (idx >= n_particles) return;
 
   // Quickly reset all acculated values from previous iteration
-  d_objs_->densities[idx]  = tol;
+  d_objs_->densities[idx]  = 1.0;
   d_objs_->pressures[idx]  = 0.0;
   for (int i = 0; i < 3; ++i) {
 
@@ -37,12 +37,44 @@ __global__ static void updateHostBuffer(
   }
 }
 
+__device__ static float magnitude(float3 a) {
+  return sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
+}
+
+__global__ static void get_max_velocity(
+  particleContainer *d_objs_,
+  uint32_t n_particles,
+  float* max_velocity
+) {
+  float3 local_velo;
+  float vec; 
+  for (uint32_t i = 0; i < n_particles; i++) {
+    local_velo = make_float3(
+      d_objs_->velocities[i],
+      d_objs_->velocities[i + n_particles],
+      d_objs_->velocities[i + 2 * n_particles]
+    );
+    vec = magnitude(local_velo);
+
+    if (i == 0) {
+      *max_velocity = vec;
+    } else if (vec > *max_velocity) {
+      *max_velocity = vec;
+    }
+  }  
+}
+
+static inline float minf(float a, float b) {
+  if (a > b) return b;
+  return a;
+}
+
 /* Generates positions from particle array */
 
 __host__ void particleIterator(
   particleContainer *d_objs_,
-  float **u_positions,
-  float **u_densities,
+  float*& u_positions,
+  float*& u_densities,
   Lookup *d_lookup_,
   std::vector<float> container,
   uint32_t n_particles,
@@ -56,6 +88,10 @@ __host__ void particleIterator(
 #ifdef __debug
   std::cout << "Grid Set\n";
 #endif
+  static float *max_velocity;
+  if (first) {
+    cudaMallocManaged(&max_velocity, sizeof(float));
+  }
 
   // Update bounds if container or particle count have changed
   updateBounds(d_lookup_, d_objs_, container, n_particles, h);
@@ -84,8 +120,12 @@ __host__ void particleIterator(
 #ifdef __debug 
   std::cout << "Enforced Boundary\n";
 #endif
+  // Update timestep
+  get_max_velocity<<<1, 1>>>(d_objs_, n_particles, max_velocity);
+  float dt = minf(1e-4f, (0.1 * h) / *max_velocity); 
+
   // Launch the first half of verlet integration that doesn't require the next step of forces
-  firstVerletKernel<<<blocks, threads>>>(d_objs_, n_particles);
+  firstVerletKernel<<<blocks, threads>>>(d_objs_, n_particles, dt);
   cudaDeviceSynchronize();
 #ifdef __debug
   std::cout << "First Verlet Pass\n";
@@ -120,14 +160,15 @@ __host__ void particleIterator(
   );
 
   // Second verlet pass with new force values
-  secondVerletKernel<<<blocks, threads>>>(d_objs_, n_particles);
+  secondVerletKernel<<<blocks, threads>>>(d_objs_, n_particles, dt);
   cudaDeviceSynchronize();
 #ifdef __debug
   std::cout << "Second Verlet Pass\n";
 #endif
   // If first iteration create managed malloc calls for cpu copy of positions and densities
-  if ((*u_positions) == NULL) {
-    cudaMallocManaged(u_positions, n_particles * sizeof(float) * 3);
+  if (u_positions == nullptr) {
+    uint64_t size = n_particles * sizeof(float) * 3;
+    cudaMallocManaged(&u_positions, size);
 
     err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -136,8 +177,8 @@ __host__ void particleIterator(
     }
   }
 
-  if ((*u_densities) == NULL) {
-    cudaMallocManaged(u_densities, n_particles * sizeof(float));
+  if (u_densities == nullptr) {
+    cudaMallocManaged(&u_densities, n_particles * sizeof(float));
 
     err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -147,7 +188,7 @@ __host__ void particleIterator(
   }
 
   // Creates single contiguous buffer of positions and densities on cpu 
-  updateHostBuffer<<<blocks, threads>>>(d_objs_, (*u_positions), (*u_densities), n_particles);
+  updateHostBuffer<<<blocks, threads>>>(d_objs_, u_positions, u_densities, n_particles);
 
   err = cudaGetLastError();
   if (err != cudaSuccess) {

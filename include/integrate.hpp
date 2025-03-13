@@ -27,7 +27,7 @@ __host__ void neighborSearch(
 );
 
 /* Verlet integration passes */
-__global__ void firstVerletKernel(particleContainer *d_objs_, uint32_t n_particles);
-__global__ void secondVerletKernel(particleContainer *d_objs_, uint32_t n_particles);
+__global__ void firstVerletKernel(particleContainer *d_objs_, uint32_t n_particles, float dt);
+__global__ void secondVerletKernel(particleContainer *d_objs_, uint32_t n_particles, float dt);
 
 #endif // __INTEGRATE_HPP__

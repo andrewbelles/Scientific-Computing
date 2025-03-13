@@ -108,8 +108,8 @@ int main(int argc, char *argv[])
     // Update Position State
     particleIterator(
       d_objs_,
-      &u_positions,
-      &u_densities,
+      u_positions,
+      u_densities,
       d_lookup_,
       container,
       particle_count,

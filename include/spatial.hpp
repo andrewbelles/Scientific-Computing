@@ -13,8 +13,8 @@
 #include <iostream>
 #include <cstdint>
 
-#define tol 1e-5
-#define scale_factor 0.2
+#define tol 1e-6
+#define scale_factor 0.1
 
 /**
  * Single entry into key/id paired table

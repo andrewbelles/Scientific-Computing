@@ -6,7 +6,6 @@
 // Defines 
 #define k 3000
 #define rho0 1000
-#define dt 5e-8      // Change to dynamically shift in value 
 #define viscosity 5e-2
 
 // #define __debug
@@ -36,7 +35,7 @@ __host__ __device__ static inline void operator+=(float3 &a, float3 b) {
 }
 
 __host__ __device__ static inline float3 operator-(const float3 a, const float3 b) {
-  return make_float3(a.x - b.z, a.y - b.z, a.z - b.z);
+  return make_float3(a.x - b.x, a.y - b.y, a.z - b.z);
 }
 
 __host__ __device__ static inline void operator-=(float3 &a, float3 b) {
@@ -142,180 +141,147 @@ __device__ static inline int3 operator+(int3 a, int3 b) {
   return make_int3(a.x + b.x, a.y + b.y, a.z + b.z);
 }
 
-/**
- * Find the density, pressure, and system forces from the built neighbor list
- */
-__global__ static void computeDensities(
+__global__ static void neighbor_kernel(
   particleContainer *d_objs_,
   Lookup *d_lookup_,
   uint32_t n_partitions,
   uint32_t n_particles,
-  uint32_t containerCount[3],
-  float h,
-  bool first
-) { 
-  uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
-  if (idx >= n_particles) return; 
-  
-  uint32_t pid = d_lookup_->table_[idx].idx;
+  const uint32_t containerBound[3],
+  const float h
+) {
+  uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x; 
+    
+  uint32_t pid = UINT32_MAX;
   uint32_t rel = 0, hash = 0, start = 0, end = 0;
   int3 cell_coord, relative_coord;
 
-  float3 relative_pos, displace;
-  float3 local_pos = make_float3(
-    d_objs_->positions[pid],
-    d_objs_->positions[pid + n_particles],
-    d_objs_->positions[pid + 2 * n_particles]
-  );
+  __shared__ uint32_t shared_indices[256 * 48];
+  const int MAX_NEIGHBORS = 48; 
+  uint32_t *neighbors = &shared_indices[threadIdx.x * MAX_NEIGHBORS];
+  int neighbor_count = 0;
+  float3 local_pos, local_vel;
 
-  float distance = 0.0;
+  if (idx < n_particles) {
+    pid = d_lookup_->table_[idx].idx;
+    assert(pid < n_particles);
 
-  // Find cell coordinate from pid position
-  cell_coord = positionToCellCoord(local_pos, h);
+    local_pos = make_float3(
+      d_objs_->positions[pid],
+      d_objs_->positions[pid + n_particles],
+      d_objs_->positions[pid + 2 * n_particles]
+    );
 
-  for (int i = 0; i < 27; ++i) {
-    relative_coord = cell_coord + offset_table[i];
+    cell_coord = positionToCellCoord(local_pos, h);
 
-    // Check if in bounds 
-    if (!inBounds(relative_coord, containerCount)) continue;
+    for (int i = 0; i < 27 && neighbor_count < MAX_NEIGHBORS; i++) {
+      relative_coord = cell_coord + offset_table[i];
+      
+      if (!inBounds(relative_coord, containerBound)) continue;
 
-    // Hash relative coordinate and get start and end values 
-    hash  = hashPosition(relative_coord, n_partitions);
-    start = d_lookup_->start_cell[hash];
-    end   = d_lookup_->end_cell[hash];
+      hash  = hashPosition(relative_coord, n_partitions);
+      assert(hash < n_partitions);
+      start = d_lookup_->start_cell[hash];
+      end   = d_lookup_->end_cell[hash];
 
-    // Empty bucket check
-    if (start == UINT32_MAX || end == UINT32_MAX) continue;
+      if (start == UINT32_MAX || end == UINT32_MAX) continue;
+      assert(start < n_particles && end < n_particles + 1);
 
-    if (start >= n_particles || end > n_particles)
-      printf("idx %u pid %u start %u end %u\n", idx, pid, start, end);
+      for (uint32_t j = start; j < end && neighbor_count < MAX_NEIGHBORS; j++) {
+        rel = d_lookup_->table_[j].idx;
+        assert(rel < n_particles);
 
-    for (uint32_t j = start; j < end; ++j) {
+        if (rel == pid) continue;
 
-      rel = d_lookup_->table_[j].idx;
+        float3 relative_pos = make_float3(
+          d_objs_->positions[rel],
+          d_objs_->positions[rel + n_particles],
+          d_objs_->positions[rel + 2 *n_particles]
+        );
 
-      if (rel == pid) continue;
+        float3 displace = local_pos - relative_pos;
+        float distance = magnitude(displace);
 
-      relative_pos = make_float3(
-        d_objs_->positions[rel],
-        d_objs_->positions[rel + n_particles],
-        d_objs_->positions[rel + 2 * n_particles]
-      );
+        if (distance > 2.0 * h) continue;
 
-      // Find distance 
-      displace = local_pos - relative_pos;
-      distance = magnitude(displace);
-
-      if (distance > 2.0 * h) continue;
-      // Denstity calculation
-      d_objs_->densities[pid] += d_objs_->masses[rel] * cubicSpline(distance, h);
-      if (pid == 0 && first) {
-        printf("Density = %f summed from relative %u\n", d_objs_->densities[pid], rel);
+        assert(neighbor_count < MAX_NEIGHBORS);
+        neighbors[neighbor_count++] = rel;
       }
     }
-  }
-  d_objs_->pressures[pid] = k * (d_objs_->densities[pid] - rho0);
-}
 
-__global__ static void computeForces(
-  particleContainer *d_objs_,
-  Lookup *d_lookup_,
-  uint32_t n_partitions,
-  uint32_t n_particles,
-  uint32_t containerCount[3],
-  float h
-) {
-  uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
-  if (idx >= n_particles) return; 
-  
-  uint32_t pid = d_lookup_->table_[idx].idx;
-  uint32_t rel = 0, hash = 0, start = 0, end = 0;
-  int3 cell_coord, relative_coord;
+    for (int i = 0; i < neighbor_count; i++) {
+      rel = neighbors[i];
+      assert(rel < n_particles);
 
-  float3 relative_pos, displace;
-  float3 pressure_force = make_float3(0.0, 0.0, 0.0), viscosity_force = make_float3(0.0, 0.0, 0.0);
-  float3 local_pos = make_float3(
-    d_objs_->positions[pid],
-    d_objs_->positions[pid + n_particles],
-    d_objs_->positions[pid + 2 * n_particles]
-  );
-
-  float distance = 0.0;
-
-  // Find cell coordinate from pid position
-  cell_coord = positionToCellCoord(local_pos, h);
-
-  for (int i = 0; i < 27; ++i) {
-    relative_coord = cell_coord + offset_table[i];
-
-    // Check if in bounds 
-    if (!inBounds(relative_coord, containerCount)) continue;
-
-    // Hash relative coordinate and get start and end values 
-    hash  = hashPosition(relative_coord, n_partitions);
-    start = d_lookup_->start_cell[hash];
-    end   = d_lookup_->end_cell[hash];
-
-    // Empty bucket check
-    if (start == UINT32_MAX || end == UINT32_MAX) continue;
-
-    for (uint32_t j = start; j < end; ++j) {
-
-      rel = d_lookup_->table_[j].idx;
-
-      if (rel == pid) continue;
-
-      relative_pos = make_float3(
+      float3 relative_pos = make_float3(
         d_objs_->positions[rel],
         d_objs_->positions[rel + n_particles],
         d_objs_->positions[rel + 2 * n_particles]
       );
 
-      // Find distance 
-      displace = local_pos - relative_pos;
-      distance= magnitude(displace);
+      float3 displace = local_pos - relative_pos;
+      float distance = magnitude(displace);
 
-      if (distance > 2.0 * h) continue;
+      d_objs_->densities[pid] += d_objs_->masses[rel] * cubicSpline(distance, h);
+    }
 
-      float3 local_vel = make_float3(
-        d_objs_->velocities[pid],
-        d_objs_->velocities[pid + n_particles],
-        d_objs_->velocities[pid + 2 * n_particles]
+    // clamp density and calculate pressure
+    d_objs_->densities[pid] = max(d_objs_->densities[pid], 0.1f * rho0);
+    d_objs_->pressures[pid] = k * (d_objs_->densities[pid] - rho0);
+  }  
+
+  __syncthreads();
+
+  if (idx < n_particles) {
+    
+    float3 pressure_force  = make_float3(0.0, 0.0, 0.0);
+    float3 viscosity_force = make_float3(0.0, 0.0, 0.0); 
+
+    local_vel = make_float3(
+      d_objs_->velocities[pid],
+      d_objs_->velocities[pid + n_particles],
+      d_objs_->velocities[pid + 2 * n_particles]
+    );
+
+    for (int i = 0; i < neighbor_count; i++) {
+      rel = neighbors[i];
+
+      float3 relative_pos = make_float3(
+        d_objs_->positions[rel],
+        d_objs_->positions[rel + n_particles],
+        d_objs_->positions[rel + 2 * n_particles]
       );
 
-      float3 relative_vel = make_float3( 
+      float3 relative_vel = make_float3(
         d_objs_->velocities[rel],
         d_objs_->velocities[rel + n_particles],
         d_objs_->velocities[rel + 2 * n_particles]
       );
 
-      // Unit vector of direction calculation 
+      float3 displace = local_pos - relative_pos;
+      float distance = magnitude(displace);
+
       float3 direction = displace / (distance + tol);
-
-      // Calculate the intermediate values for the pressure force;
-      float pressure_value  = d_objs_->pressures[idx] / (d_objs_->densities[idx] * d_objs_->densities[idx]);
-      pressure_value       += d_objs_->pressures[rel] / (d_objs_->densities[rel] * d_objs_->densities[rel]);
-
-      //float kernel_val = gradCubicSpline(distance, h);
-      //if (kernel_val > 100 || pressure_value)
-      //  printf("pid %u kernel_val %f pressure_val %f\n", pid, kernel_val, pressure_value);
-
-      float common_term    = d_objs_->masses[rel] * pressure_value * gradCubicSpline(distance, h);
-
-      pressure_force  -= (direction * common_term);  
+      
+      // Calculate the intermediate values for the pressure force
+      float pressure_value = d_objs_->pressures[pid] / (d_objs_->densities[pid] * d_objs_->densities[pid]);
+      pressure_value += d_objs_->pressures[rel] / (d_objs_->densities[rel] * d_objs_->densities[rel]);
+      
+      float common_term = d_objs_->masses[rel] * pressure_value * gradCubicSpline(distance, h);
+      
+      pressure_force -= (direction * common_term);
       viscosity_force += (((local_vel - relative_vel) * d_objs_->masses[rel] / d_objs_->densities[rel]) * laplacianCubicSpline(distance, h));
-      //printf("press force %u: <%f,%f,%f>\nviscf force %u: <%f,%f,%f>\n", pid, pressure_force.x, pressure_force.y, pressure_force.z, pid, viscosity_force.x, viscosity_force.y, viscosity_force.z);
     }
-  }
+    // Scale by viscosity constant 
+    viscosity_force = viscosity_force * viscosity;
 
-  // Set forces 
-  d_objs_->pressure_forces[idx] = pressure_force.x;
-  d_objs_->pressure_forces[idx + n_particles] = pressure_force.y;
-  d_objs_->pressure_forces[idx + 2 * n_particles] = pressure_force.z;
- 
-  d_objs_->viscosity_forces[idx] = viscosity_force.x;
-  d_objs_->viscosity_forces[idx + n_particles] = viscosity_force.y;
-  d_objs_->viscosity_forces[idx + 2 * n_particles] = viscosity_force.z;
+    d_objs_->pressure_forces[idx] = pressure_force.x;
+    d_objs_->pressure_forces[idx + n_particles] = pressure_force.y;
+    d_objs_->pressure_forces[idx + 2 * n_particles] = pressure_force.z;
+
+    d_objs_->viscosity_forces[idx] = viscosity_force.x;
+    d_objs_->viscosity_forces[idx + n_particles] = viscosity_force.y;
+    d_objs_->viscosity_forces[idx + 2 * n_particles] = viscosity_force.z;
+  }
 }
 
 /**
@@ -330,36 +296,12 @@ __host__ void neighborSearch(
   float h,
   bool first
 ) {
-  static uint32_t blocks = 0, threads = 0;
-  setGridSize(&blocks, &threads, n_particles);
+  //static uint32_t blocks = 0, threads = 0;
+  //setGridSize(&blocks, &threads, n_particles);
+  dim3 threads(256), blocks((n_particles + 256 - 1) / 256);
   cudaError_t err;
 
-  computeDensities<<<blocks, threads>>>(
-    d_objs_,
-    d_lookup_,
-    n_partitions,
-    n_particles,
-    containerCount,
-    h,
-    first
-  );
-
-  err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    std::cerr << "Force Compute: " << cudaGetErrorString(err) << '\n';
-    exit(EXIT_FAILURE);
-  }
-  
-  cudaDeviceSynchronize();
-
-  err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    std::cerr << "Force Sync: " << cudaGetErrorString(err) << '\n';
-    exit(EXIT_FAILURE);
-  }
-  
-  // Expected success 
-  computeForces<<<blocks, threads>>>(
+  neighbor_kernel<<<blocks, threads>>>(
     d_objs_,
     d_lookup_,
     n_partitions,
@@ -367,26 +309,17 @@ __host__ void neighborSearch(
     containerCount,
     h
   );
-
-  err = cudaGetLastError();
+  err = cudaDeviceSynchronize();
   if (err != cudaSuccess) {
-    std::cerr << "Force Compute: " << cudaGetErrorString(err) << '\n';
-    exit(EXIT_FAILURE);
-  }
-  
-  cudaDeviceSynchronize();
-
-  err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    std::cerr << "Force Sync: " << cudaGetErrorString(err) << '\n';
-    exit(EXIT_FAILURE);
+    std::cerr << "Neighbor Failure: " << cudaGetErrorString(err) << '\n';
+    return;
   }
 }
 
 /*
    Completes the first section of verlet integration
    */
-__global__ void firstVerletKernel(particleContainer *d_objs_, uint32_t n_particles) {
+__global__ void firstVerletKernel(particleContainer *d_objs_, uint32_t n_particles, float dt) {
   uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
   if (idx >= n_particles) return;
 
@@ -400,7 +333,7 @@ __global__ void firstVerletKernel(particleContainer *d_objs_, uint32_t n_particl
     forceSum[i] += (scale_factor * (d_objs_->pressure_forces[co] + d_objs_->viscosity_forces[co] + d_objs_->repulsive_forces[co]));
     
     // Integrates the velocity and position
-    d_objs_->velocities[co] += (forceSum[i] * static_cast<float>(0.5 * dt));
+    d_objs_->velocities[co] += (forceSum[i] * static_cast<float>(0.5 * dt)) * 0.99;
     d_objs_->positions[co] += (d_objs_->velocities[co] * static_cast<float>(dt));
   }
 }
@@ -408,7 +341,7 @@ __global__ void firstVerletKernel(particleContainer *d_objs_, uint32_t n_particl
 /*
    Second pass of verlet integration
    */
-__global__ void secondVerletKernel(particleContainer *d_objs_, uint32_t n_particles) {
+__global__ void secondVerletKernel(particleContainer *d_objs_, uint32_t n_particles, float dt) {
   uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
   if (idx >= n_particles) return;
 
