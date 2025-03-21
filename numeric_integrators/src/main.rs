@@ -1,10 +1,10 @@
 // Example functions to integrate over 
 pub fn square(x: f64) -> f64 {
-    return x * x;
+    x * x
 }
 
 pub fn sin_cubed(x: f64) -> f64 {
-    return (x.sin()).powf(3.0);
+    (x.sin()).powf(3.0)
 }
 
 // Factorial function to create cache at compile time 
@@ -18,7 +18,7 @@ const fn cache_factorial(n: usize) -> u64 {
             let mut i = 1;
             // Multiplies result to each subsequent i 
             while i <= n {
-                result = result * i as u64;
+                result *= i as u64;
                 i += 1;
             }
             result 
@@ -85,7 +85,7 @@ impl Evaluate for Polynomial {
         for (i, &coeff) in self.coefficients.iter().enumerate() {
            result += coeff * x.powi(i as i32); 
         }
-        return result;
+        result
     }
     // Pull Degree
     fn degree(&self) -> u64 {
@@ -103,7 +103,7 @@ impl Evaluate for SeriesFunction {
             let eval = self.funcs[i].evaluate(x);
             result += coeff * eval.powf(self.func_exp[i] as f64);
         }
-        return result;     
+        result     
     }
     fn degree(&self) -> u64 {
         self.poly.degree
@@ -157,14 +157,14 @@ pub fn trapezoid(func: &dyn Evaluate, a: f64, b: f64) -> f64 {
     integral += 0.5 * func.evaluate(b) + 0.5 * func.evaluate(a);
 
     // Loops over all trapezoids
-    for i in 0..(n as u64) {
+    for i in 0..n {
         let dx: f64 = a + (i as f64) * height; 
         integral += func.evaluate(dx);
     }
 
     // Scales by height and returns
     integral *= height;
-    return integral;
+    integral
 }
 
 // Polynomial "Constructor". Generates a polynomial of requested size 
