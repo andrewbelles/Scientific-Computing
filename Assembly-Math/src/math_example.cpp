@@ -1,22 +1,4 @@
-#include <cstdlib>
-#include <iostream>
-#include <random>
-#include <benchmark.hpp>
-
-// Check for avx512 support
-#include <immintrin.h>
-
-// Simple ASM Reductions 
-extern "C" float sum_horizontal_avx512(float* x);
-extern "C" float sum_vertical_avx512(float* x);
-extern "C" float sum_horizontal_avx2(float* x);
-extern "C" float sum_vertical_avx2(float* x);
-extern "C" float sum_horizontal_avx(float* x);
-extern "C" float sum_vertical_avx(float* x);
-
-// Advanced Reductions 
-extern "C" float quicksum_havx512(float* x, size_t n);
-extern "C" float quicksum_vavx512(float* x, size_t n);
+#include "../include/math_example.hpp"
 
 // Initialize array to be summed 
 static void init_array(float* x, int n) {
@@ -80,7 +62,7 @@ int main(void) {
   auto error_function = [](float base, float result) { return (base - result); };
   Benchmark<float, float, float*> simple_benchmark(naive_simple_sum, error_function, 100000, x);
 
-  std::cout << "\n16 Element Array Case:\n\n";
+  std::cout << "\n 16 Element Array Case:\n\n";
 
   simple_benchmark.insert(unrolled_simple_sum, "Unrolled Naive");
   simple_benchmark.insert(sum_horizontal_avx512, "Horizontal AVX-512");
@@ -102,11 +84,15 @@ int main(void) {
 
   Benchmark<float, float, float*, size_t> complex_benchmark(naive_sum, error_function, 100000, x, n);
 
-  std::cout << "\nLarger Array Case:\n\n";
+  std::cout << "\n " << 16*n << " Array Case:\n\n";
 
   // Compute benchmarks for quicksums 
   complex_benchmark.insert(quicksum_havx512, "Horizontal AVX-512");
   complex_benchmark.insert(quicksum_vavx512, "Vertical   AVX-512");
+  complex_benchmark.insert(quicksum_havx2, "Horizontal AVX2");
+  complex_benchmark.insert(quicksum_vavx2, "Vertical   AVX2");
+  complex_benchmark.insert(quicksum_havx, "Horizontal AVX");
+  complex_benchmark.insert(quicksum_vavx, "Vertical   AVX");
 
   complex_benchmark.run();
 
