@@ -1,4 +1,4 @@
-#include "benchmark_temp.hpp"
+#include "../benchmark.hpp"
 
 __attribute__((optnone))
 static float add(float a, float b)

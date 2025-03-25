@@ -1,4 +1,4 @@
-#include "benchmark.hpp"
+#include "../benchmark.hpp"
 #include <cmath>
 #include <cstdlib>
 #include <random>
@@ -27,7 +27,7 @@ static std::vector<float> random_vector_float(size_t size)
 }
 
 __attribute__((optnone))
-static float naive_square_root(float x)
+static float naive_square_root(float& x)
 {
   float guess = x / 2.0;
   for (int i = 0; i < 15; i++)
@@ -38,7 +38,7 @@ static float naive_square_root(float x)
 }
 
 // Simple embedded sqrt 
-static float emb_sqrt(float x)
+static float emb_sqrt(float& x)
 {
   float res;
   asm
@@ -51,14 +51,14 @@ static float emb_sqrt(float x)
 }
 
 __attribute__((optnone))
-static float sqrt_wrapper(float x)
+static float sqrt_wrapper(float& x)
 {
   return std::sqrt(x);
 }
 
 // Vector benchmark functions
 __attribute__((optnone))
-static float sqrt_vec_wrapper(std::vector<float> x)
+static float sqrt_vec_wrapper(std::vector<float>& x)
 {
   float average = 0.0; 
   for (size_t i = 0; i < x.size(); i++)
@@ -69,7 +69,7 @@ static float sqrt_vec_wrapper(std::vector<float> x)
 }
 
 __attribute__((optnone))
-static float naive_vec_sqrt(std::vector<float> x)
+static float naive_vec_sqrt(std::vector<float>& x)
 {
   float average = 0.0; 
   for (size_t i = 0; i < x.size(); i++)
@@ -120,7 +120,7 @@ size_t naive_selection_sort(std::vector<T>& x)
 }
 
 template<typename T>
-size_t std_sort_wrapper_raw(T* x, size_t elements)
+size_t std_sort_wrapper_raw(T*& x, size_t& elements)
 {
 
   size_t comparisons = 0;
@@ -133,7 +133,7 @@ size_t std_sort_wrapper_raw(T* x, size_t elements)
 }
 
 template<typename T>
-size_t naive_selection_sort_raw(T* x, size_t elements)
+size_t naive_selection_sort_raw(T*& x, size_t& elements)
 {
   size_t comparisons = 0;
   for (size_t i = 0; i < elements; i++)
