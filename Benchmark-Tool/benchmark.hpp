@@ -191,9 +191,6 @@ public:
   template<size_t... Is>
   void prepare_args(std::index_sequence<Is...>, Args... args)
   {
-    // Assign to class member as tuple
-    args_ = std::make_tuple(args...);
-    
     // Initializes array to length of tuple Args w/ value 1
     pointer_sizes.resize(sizeof...(Args), 1);
     
@@ -210,6 +207,12 @@ public:
   {
     reset_references(std::make_index_sequence<sizeof...(Args)>{});
     return args_refs;
+  }
+
+  template<typename S>
+  auto& refs()
+  {
+    return get_tuple_from_ref<S>();
   }
 
   // Benchmark indexes
@@ -311,6 +314,27 @@ private:
 
     // Return explicit references to args 
     args_refs = std::make_tuple(std::ref(std::get<Is>(args_copy))...);
+  }
+
+  template<typename S>
+  S& get_tuple_from_ref()
+  {
+    return [&]<size_t... Is>(std::index_sequence<Is...>) -> S&
+    {
+      S* result = nullptr;
+
+      // Pattern to fold args... and extract matching stype
+      ((std::is_same_v<S, std::decay_t<std::tuple_element_t<Is, std::tuple<std::decay_t<Args>...>>>> ?
+        (result = &std::get<Is>(args_copy), true) : false) || ...);
+
+      // result remains a nullptr if not contained in args...
+      if (result == nullptr)
+      {
+        throw std::runtime_error("Type " + std::string(typeid(S).name()) + " not found in tuple of arguments. Type must be listed in benchmark arguments");
+      }
+
+      return *result; // Return dereference 
+    } (std::make_index_sequence<sizeof...(Args)>{});
   }
 };
 
@@ -689,6 +713,10 @@ private:
 // Error function follows error func(void*, void*)
 // where void* refers to some struct or value being compared within the function 
 //
+
+template<typename T>
+struct TypeTag { using type = T; };
+
 template<typename Error, typename... Args>
 class Benchmark<Error, void, Args...>
 {
@@ -696,10 +724,11 @@ public:
   using fn_benchmark = std::function<void(std::add_lvalue_reference_t<std::decay_t<Args>>...)>;
   using fn_error = typename rootComplexError<Error>::fn_error;      // Grab to simplify references
 
+
   // Constructor requires template for type to be encapsulated 
   template<typename Function, typename S>
     requires AllReferences<Function>
-  Benchmark(fn_error func_e, Function&& func_b, size_t iter, Args... args) :
+  Benchmark(fn_error func_e, Function&& func_b, TypeTag<S>, size_t iter, Args... args) :
     stype(typeid(S)),
     complex_(func_e),
     amgr_(iter, args...)
@@ -774,7 +803,7 @@ public:
 
         // Collect modified argument from each call
         if (i == amgr_.iter - 1)
-          local_arguments[j] = std::forward<stype>(get_first_stype<stype>(std::make_index_sequence<sizeof...(Args)>{}, amgr_.args_copy));
+          local_arguments[j] = amgr_.refs<stype>(arguments);
 
         auto runtime = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
         average_runtime[k] += static_cast<double>(runtime.count());
@@ -829,13 +858,14 @@ private:
       (void)std::apply(functions[0], arguments);
       auto end   = std::chrono::high_resolution_clock::now();
 
+      // Get argument matching type of type requested to be encapsulated 
+      if (i == amgr_.iter - 1)
+        base_argument = amgr_.refs<stype>(arguments);
+      
       auto runtime = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
       average_runtime += static_cast<double>(runtime.count());
     }
     average_runtime /= amgr_.iter;  // Ave of accumulated
-    
-    // Get argument matching type of type requested to be encapsulated 
-    base_argument = std::forward<stype>(get_first_stype<stype>(std::make_index_sequence<sizeof...(Args)>{}, amgr_.args_copy));
 
     // Copy twice 
     auto a = std::any_cast<stype>(base_argument);
@@ -857,24 +887,6 @@ private:
     };
 
     complex_.results.push_back(result);
-  }
-
-  template<typename S, size_t... Is>
-  S& get_first_stype(std::index_sequence<Is...>, std::tuple<Args...>& src)
-  {
-    S* result = nullptr;
-
-    [&]<size_t... Js>(std::index_sequence<Js...>) 
-    {
-      ((result = std::is_same_v<S, std::tuple_element_t<Js, std::tuple<Args...>>> ?
-        &std::get<Js>(src) : result), ...);
-    } (std::make_index_sequence<sizeof...(Args)>{});
-
-    if (result == nullptr) 
-    {
-      throw std::runtime_error("Type not found within argument list");
-    }
-    return *result;   // Return dereferenced result
   }
 };
 
