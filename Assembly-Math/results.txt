@@ -1,0 +1,38 @@
+
+Iterations: 1000
+ID                              Runtime         Speedup         Result          Error           
+----------------------------------------------------------------------------------------------
+Baseline                        534.1490 ns     1.000000x fast  62              0               
+ASM Merge Sort                  181.2370 ns     2.947240x fast  45              -17             
+
+
+Iterations: 100000
+ID                              Runtime         Speedup         Result          Error           
+----------------------------------------------------------------------------------------------
+Baseline                        94.5212 ns      1.000000x fast  29.270325       0.000000        
+Vertical   AVX                  65.1984 ns      1.449748x fast  24.101040       -5.169285       
+Horizontal AVX                  64.7815 ns      1.459077x fast  29.270325       0.000000        
+Vertical   AVX2                 65.0396 ns      1.453286x fast  27.744606       -1.525719       
+Horizontal AVX2                 64.9079 ns      1.456235x fast  29.270325       0.000000        
+Vertical   AVX-512              64.5530 ns      1.464242x fast  29.270325       0.000000        
+Horizontal AVX-512              61.1354 ns      1.546097x fast  29.270325       0.000000        
+
+
+Iterations: 100
+ID                              Runtime         Speedup         Result          Error           
+----------------------------------------------------------------------------------------------
+Baseline                        9.6244 ms       1.000000x fast  1258891         0               
+ASM Merge Sort                  4.1587 ms       2.314252x fast  965776          -293115         
+
+
+Iterations: 100000
+ID                              Runtime         Speedup         Result          Error           
+----------------------------------------------------------------------------------------------
+Baseline                        158.2926 us     1.000000x fast  -2073.881836    0.000000        
+Horizontal AVX-512              4.9119 us       32.226418x fast -2073.881592    0.000244        
+Horizontal AVX                  4.7931 us       33.024879x fast -2073.881348    0.000488        
+Vertical   AVX-512              4.6556 us       34.000198x fast -2073.881592    0.000244        
+Vertical   AVX                  3.4995 us       45.233067x fast -2073.881348    0.000488        
+Horizontal AVX2                 3.7259 us       42.483860x fast -2073.881592    0.000244        
+Vertical   AVX2                 3.2711 us       48.391739x fast -2073.881592    0.000244        
+

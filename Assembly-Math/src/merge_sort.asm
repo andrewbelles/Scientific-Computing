@@ -2,7 +2,7 @@ section .text
 global merge_sort
 extern malloc, free
 
-; extern "C" int merge_sort(float* x, size_t n);
+; extern "C" int merge_sort(float*& x, size_t& n);
 ; rdi holds pointer to x 
 ; rsi is true size 
 
@@ -20,9 +20,10 @@ merge_sort:
   xor r15, r15
   ; Ensure 16-byte stack alignment
   sub rsp, 8
-  ; save ptr to array and size
-  mov r12, rdi        ; Store array pointer in r12
-  mov r13, rsi        ; Store size in r13
+  ; Save ptr to array and size
+  ; Super important that [] is used to dereference as they are pbr
+  mov r12, [rdi]        ; Store array pointer in r12
+  mov r13, [rsi]        ; Store size in r13
   ; Create temporary array 
   mov rdi, r13        ; Size in elements
   shl rdi, 2          

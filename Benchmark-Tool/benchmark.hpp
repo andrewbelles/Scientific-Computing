@@ -4,15 +4,15 @@
 // Utilities
 #include <chrono>
 #include <cmath>
-#include <iomanip>
 #include <vector>
 
 // IO
 #include <cstring>
 #include <string>
+#include <iomanip>
+#include <iostream>
 
 // Simple Abstraction 
-#include <iostream>
 #include <utility>
 
 // Complex Abstraction
@@ -259,14 +259,15 @@ private:
 
     size_t size = pointer_sizes[I];
 
-    auto* ptr_copy = new pointer_type[size];
+    // Aligned alloc for guaranteed alignment for asm functions 
+    auto* ptr_copy = static_cast<pointer_type*>(aligned_alloc(64, size * sizeof(pointer_type)));
     std::memcpy(ptr_copy, arg, size * sizeof(pointer_type));
 
     // Push into vector the new unique pointer and a delete method
     ptr_copies.push_back(
       std::unique_ptr<void, std::function<void(void*)>>(
         ptr_copy,
-        [](void* ptr) { delete[] static_cast<pointer_type*>(ptr); }
+        [](void* ptr) { free(ptr); }  // Aligned alloc
       )
     );
     return ptr_copy;
@@ -355,15 +356,15 @@ public:
     // Iterate over n^2 and skip identical indices
     for (size_t i = 1; i < size; i++)
     {
-      for (size_t j = 1; j < size; j++)
+      size_t min_idx = i;
+      for (size_t j = i + 1; j < size; j++)
       {
-        // Skip identical
-        if (i == j) continue;
-
         // Compare
         if (get_at_index(i).runtime < get_at_index(j).runtime)
-          swap(i, j);   // Swap with preferred method 
+           min_idx = j;
       }
+      if (min_idx != i)
+        swap(i, min_idx);
     }
   }
 };    // Inheritable within anonymous namespace
@@ -387,39 +388,41 @@ public:
   rootSimple(fn_error func) : error_function(func) { results.clear(); }
 
   // Print implementation 
-  void print()
+  void print(size_t iter, std::ostream& stream = std::cout)
   {
     SortManager::sort();                  // Abstract class handles sorting  
 
     // Header
-    std::cout << std::left << std::setw(32) << "ID"
+    stream << "\nIterations: " << iter << '\n';
+    stream << std::left << std::setw(32) << "ID"
               << std::setw(16) << "Runtime"
               << std::setw(16) << "Speedup"
               << std::setw(16) << "Result"
               << std::setw(16) << "Error"
               << '\n';
-    std::cout << "----------------------------------------------------------------------------------------------"
+    stream << "----------------------------------------------------------------------------------------------"
               << '\n';
 
     for (size_t i = 0; i < results.size(); i++)
     {
-      std::cout << std::left << std::setw(32) << results[i].data.id;
+      stream << std::left << std::setw(32) << results[i].data.id;
       
       std::string runtime_str = format_runtime_string(results[i].data.runtime);
-      std::cout << std::left << std::setw(16) << runtime_str;
+      stream << std::left << std::setw(16) << runtime_str;
       
       // Formatted string to include x fast 
       std::ostringstream speedup_str;
       speedup_str << std::fixed << std::setprecision(6) << results[i].data.speedup << "x fast";
-      std::cout << std::left << std::setw(16) << speedup_str.str();
+      stream << std::left << std::setw(16) << speedup_str.str();
       
       // Result column
-      std::cout << std::setw(16) << std::fixed << std::setprecision(6) << results[i].value;
+      stream << std::setw(16) << std::fixed << std::setprecision(6) << results[i].value;
 
       // Error column
-      std::cout << std::setw(16) << std::fixed << std::setprecision(6) << results[i].error;
-      std::cout << '\n';
+      stream << std::setw(16) << std::fixed << std::setprecision(6) << results[i].error;
+      stream << '\n';
     }
+    stream << '\n';
   }
 
   // Members unique to this template
@@ -451,35 +454,37 @@ public:
   rootComplexError(fn_error func) : error_function(func) { results.clear(); }
 
   // Print implementation 
-  void print()
+  void print(size_t iter, std::ostream& stream = std::cout)
   {
     SortManager::sort();                  // Abstract class handles sorting  
 
     // Header
-    std::cout << std::left << std::setw(32) << "ID"
+    stream << "\nIterations: " << iter << '\n';
+    stream << std::left << std::setw(32) << "ID"
               << std::setw(16) << "Runtime"
               << std::setw(16) << "Speedup"
               << std::setw(16) << "Error"
               << '\n';
-    std::cout << "--------------------------------------------------------------------------------------"
+    stream << "--------------------------------------------------------------------------------------"
               << '\n';
 
     for (size_t i = 0; i < results.size(); i++)
     {
-      std::cout << std::left << std::setw(32) << results[i].data.id;
+      stream << std::left << std::setw(32) << results[i].data.id;
       
       std::string runtime_str = format_runtime_string(results[i].data.runtime);
-      std::cout << std::left << std::setw(16) << runtime_str;
+      stream << std::left << std::setw(16) << runtime_str;
       
       // Formatted string to include x fast 
       std::ostringstream speedup_str;
       speedup_str << std::fixed << std::setprecision(6) << results[i].data.speedup << "x fast";
-      std::cout << std::left << std::setw(16) << speedup_str.str();
+      stream << std::left << std::setw(16) << speedup_str.str();
       
       // Errorcolumn
-      std::cout << std::setw(16) << std::fixed << std::setprecision(6) << results[i].error;
-      std::cout << '\n';
+      stream << std::setw(16) << std::fixed << std::setprecision(6) << results[i].error;
+      stream << '\n';
     }
+    stream << '\n';
   }
 
   fn_error error_function;
@@ -496,34 +501,36 @@ class rootVoid : public SortManager
 {
 public:
    
-  rootVoid(void) : results(1, Data()) {}
+  rootVoid(void) : results() {}
 
   // Print implementation 
-  void print() 
+  void print(size_t iter, std::ostream& stream = std::cout) 
   {
     SortManager::sort();                  // Abstract class handles sorting  
 
     // Header
-    std::cout << std::left << std::setw(32) << "ID"
+    stream << "\nIterations: " << iter << '\n';
+    stream << std::left << std::setw(32) << "ID"
               << std::setw(16) << "Runtime"
               << std::setw(16) << "Speedup"
               << '\n';
-    std::cout << "---------------------------------------------------------------------------------"
+    stream << "---------------------------------------------------------------------------------"
               << '\n';
 
     for (size_t i = 0; i < results.size(); i++)
     {
-      std::cout << std::left << std::setw(32) << results[i].id;
+      stream << std::left << std::setw(32) << results[i].id;
       
       std::string runtime_str = format_runtime_string(results[i].runtime);
-      std::cout << std::left << std::setw(16) << runtime_str;
+      stream << std::left << std::setw(16) << runtime_str;
       
       // Formatted string to include x fast 
       std::ostringstream speedup_str;
       speedup_str << std::fixed << std::setprecision(6) << results[i].speedup << "x fast";
-      std::cout << std::left << std::setw(16) << speedup_str.str();
-      
+      stream << std::left << std::setw(16) << speedup_str.str();
+      stream << '\n';
     }
+    stream << '\n';
   }
 
   std::vector<Data> results;
@@ -654,7 +661,7 @@ public:
   }
 
   // Print results 
-  void print() { simple_.print(); }
+  void print(std::ostream& stream = std::cout) { simple_.print(amgr_.iter, stream); }
 
 private:
   // Standard members
@@ -834,7 +841,7 @@ public:
     return true;
   }
 
-  void print() { complex_.print(); }
+  void print(std::ostream& stream = std::cout) { complex_.print(amgr_.iter, stream); }
 
 private:
   // Standard members
@@ -991,7 +998,7 @@ public:
     return true;
   }
 
-  void print() { rvoid_.print(); }
+  void print(std::ostream& stream = std::cout) { rvoid_.print(amgr_.iter, stream); }
 
 private:
   // Standard Members 
