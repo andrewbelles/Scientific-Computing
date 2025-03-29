@@ -290,25 +290,80 @@ private:
 
     if (pool.count(target_id) && pool.at(target_id) > tol)
       fitness = 100.0 * pool.at(target_id); 
-
+    
+    
     // Find all inputs that direct to the output and give some reward for producing them
-    std::unordered_set<int> direct_inputs;
+    // Find all inputs that direct to the output and their required amounts
+    std::unordered_map<int, float> direct_inputs_required;
+    std::unordered_map<int, float> direct_inputs_output_rates;
+    
     for (const auto& F : graph.get_functors())
     {
       if (F.output.first == target_id)
       {
-        for (const auto& [input_id, _] : F.inputs)
-          direct_inputs.insert(input_id);
+        for (const auto& [input_id, amount] : F.inputs)
+        {
+          direct_inputs_required[input_id] = amount;
+        }
+      }
+    }
+    
+    // Find the output rates for each intermediate product
+    for (const auto& F : graph.get_functors())
+    {
+      if (direct_inputs_required.find(F.output.first) != direct_inputs_required.end())
+        direct_inputs_output_rates[F.output.first] = F.output.second;
+    }
+
+    // Reward for producing penultimate products, scaled by their output rates
+    for (const auto& [input_id, required_amount] : direct_inputs_required)
+    {
+      auto it = pool.find(input_id);
+      if (it != pool.end() && it->second > tol)
+      {
+        float output_rate = 1.0; 
+        auto rate_it = direct_inputs_output_rates.find(input_id);
+        if (rate_it != direct_inputs_output_rates.end() && rate_it->second > tol)
+          output_rate = rate_it->second;
+
+        float scaled_output = 0.1 * std::exp(-0.05 * output_rate);
+        fitness += (it->second * scaled_output);
       }
     }
 
-    // Reward for producing penultimate products 
-    for (int input_id : direct_inputs)
+    // Reward for using all source nodes 
+    std::unordered_set<int> used_sources;
+    std::unordered_set<int> all_sources; 
+
+    for (const auto& resource : graph.get_resources())
     {
-      auto it = pool.find(input_id);
-      if (it != pool.end())
-        fitness += it->second * 0.05;
+      if (resource.is_source)
+        all_sources.insert(resource.id);
     }
+
+    std::unordered_map<int, float> initial_pool = graph.initialize_resource_pool();
+    for (int source_id : all_sources)
+    {
+      auto it_initial = initial_pool.find(source_id);
+      auto it_current = pool.find(source_id);
+
+      float initial_amount = (it_initial != initial_pool.end()) ? it_initial->second : 0.0;
+      float current_amount = (it_current != pool.end()) ? it_current->second : 0.0;
+
+      if (current_amount < initial_amount + tol)
+        used_sources.insert(source_id);
+    }
+
+    if (!all_sources.empty())
+    {
+      float source_usage_ratio = static_cast<float>(used_sources.size() / all_sources.size());
+      float source_usage_bonus = 30.0 * source_usage_ratio;
+      fitness += source_usage_bonus;
+
+      if (used_sources.size() == all_sources.size())
+        fitness += 15.0;
+    }
+
 
     return fitness;
   }
@@ -810,6 +865,9 @@ private:
       max_applications = std::min(max_applications, possible);
     }
 
+    if (max_applications == 0)
+      return;
+
     std::uniform_int_distribution<int> c(1, max_applications);
     int count = c(rng);
 
@@ -949,10 +1007,131 @@ private:
       max_applications = std::min(max_applications, possible);
     }
 
+    if (max_applications == 0)
+      return;
+
     std::uniform_int_distribution<int> c(1, max_applications);
     int count = c(rng);
 
     map[functor_id] += count;
+  }
+
+  void chain(std::unordered_map<int, int>& map)
+  {
+    const auto& functors = graph.get_functors();
+
+    std::uniform_real_distribution<float> t(0.0, 1.0);
+
+    int target_id = graph.get_target();
+    std::vector<int> target_producers;
+
+    for (const auto& F : functors)
+    {
+      if (F.output.first == target_id)
+        target_producers.push_back(F.id);
+    }
+
+    
+    int start_functor_id;
+    if (t(rng) < 0.2 && !target_producers.empty())
+    {
+      std::uniform_int_distribution<size_t> p(0, target_producers.size() - 1);
+      start_functor_id = target_producers[p(rng)];
+    }
+    else 
+    {
+      std::vector<int> non_target_functors;
+      for (const auto& F : functors)
+      {
+        bool is_target_producer = false;
+        for (int id : target_producers)
+        {
+          if (F.id == id)
+          {
+            is_target_producer = true;
+            break;
+          }
+        }
+
+        if (!is_target_producer)
+          non_target_functors.push_back(F.id);
+      }
+
+      if (non_target_functors.empty())
+      {
+        std::uniform_int_distribution<size_t> f(0, functors.size() - 1); 
+        start_functor_id = functors[f(rng)].id;
+      }
+      else  
+      {   
+        std::uniform_int_distribution<size_t> f(0, non_target_functors.size() - 1); 
+        start_functor_id = functors[f(rng)].id;
+      }
+    }
+
+    map[start_functor_id] += 1;
+
+    std::unordered_map<int, float> required_resources;
+    const auto& G = graph.get_functor(start_functor_id);
+
+    for (const auto& [input_id, amount] : G.inputs)
+      required_resources[input_id] = amount;
+
+    // Complex problems with more than 3+ depth shouldn't try to add functors near end in this fashion
+    std::unordered_set<int> processed_resources;
+    int chain_depth = 0;
+    const int max_depth = 3;
+
+    while (chain_depth < max_depth)
+    {
+      std::vector<int> resources_to_process;
+      for (const auto& [resource_id, amount] : required_resources)
+      {
+        if (!processed_resources.count(resource_id) &&
+            !graph.get_resource(resource_id).is_source)
+          resources_to_process.push_back(resource_id);
+      }
+
+      if (resources_to_process.empty())
+        break;
+
+      for (int resource_id : resources_to_process)
+      {
+        processed_resources.insert(resource_id);
+
+        std::vector<int> producing_functors;
+        for (const auto& F : functors)
+        {
+          if (F.output.first == resource_id)
+            producing_functors.push_back(F.id);
+        }
+
+        if (producing_functors.empty())
+          continue;
+
+        std::uniform_int_distribution<size_t> p(0, producing_functors.size() - 1);
+        int functor_id = producing_functors[p(rng)]; 
+        const auto& F = graph.get_functor(functor_id);
+
+        float required_amount = required_resources[resource_id];
+        float output_per_application = F.output.second;
+
+        int applications = static_cast<int>(std::ceil(required_amount / output_per_application));
+
+        map[functor_id] += applications;
+
+        for (const auto& [input_id, input_amount] : F.inputs)
+        {
+          float total_required = input_amount * applications;
+
+          if (required_resources.find(input_id) != required_resources.end())
+            required_resources[input_id] += total_required;
+          else 
+            required_resources[input_id] = total_required;
+        }
+      }
+      chain_depth++;
+    }
   }
 
   // Creates a random solution using the four add, remove, modify, swap operations 
@@ -978,8 +1157,8 @@ private:
     
     // Hunt while resources can be expended 
     bool available_resources = true;
-    size_t iter(0);
-    while (available_resources && iter < 40) // Some check for exhausted resources 
+    //size_t iter(0);
+    while (available_resources) // Some check for exhausted resources 
     {
       if (d(rng) < probs.add)
         add(map, current_resources);
@@ -992,7 +1171,10 @@ private:
 
       if (d(rng) < probs.direct)
         direct(map, current_resources);
-      
+
+      //if (d(rng) < 0.1)
+      //  chain(map);
+
       std::unordered_map<int, float> pool = graph.initialize_resource_pool();
       graph.update(pool, map);
       current_resources = pool;
@@ -1011,7 +1193,7 @@ private:
       if (d(rng) < 0.05)
         available_resources = false;
 
-      iter++;
+      //iter++;
     }
 
     // Constructor call handles solution evaluation
@@ -1049,8 +1231,8 @@ private:
     // Random operations 
 
     bool available_resources = true;
-    size_t iter(0);
-    while (available_resources && iter < 40) // Some check for exhausted resources 
+    //size_t iter(0);
+    while (available_resources) // Some check for exhausted resources 
     {
       if (d(rng) < probs.add)
         add(map, current_resources);
@@ -1063,7 +1245,10 @@ private:
 
       if (d(rng) < probs.direct)
         direct(map, current_resources);
-      
+
+      //if (d(rng) < 0.1)
+      // chain(map);
+
       std::unordered_map<int, float> pool = graph.initialize_resource_pool();
       graph.update(pool, map);
       current_resources = pool;
@@ -1082,7 +1267,7 @@ private:
       if (d(rng) < 0.05)
         available_resources = false;
 
-      iter++;
+      //iter++;
     }
 
     // Evaluate and return sequence 
@@ -1107,6 +1292,49 @@ private:
     wasp.hunting_radius = std::max(min_hunting_radius, wasp.hunting_radius * radius_decay);
   }
 
+  void prune_map(std::unordered_map<int, int>& map)
+  {
+    std::unordered_map<int, float> pool = graph.initialize_resource_pool();
+    std::vector<int> ordering = graph.sort(map);
+    std::unordered_map<int, int> reduced_map;
+
+    for (int functor_id : ordering)
+    {
+      int count = map.at(functor_id);
+      const auto& F = graph.get_functor(functor_id);
+
+      int max_applications = count;
+      for (const auto& [resource_id, required_amount] : F.inputs)
+      {
+        auto it = pool.find(resource_id);
+        if (it == pool.end() || required_amount <= tol)
+        {
+          max_applications = 0;
+          break;
+        }
+
+        int possible = static_cast<int>(it->second / required_amount);
+        max_applications = std::min(max_applications, possible);
+      }
+
+      if (max_applications > 0)
+      {
+        reduced_map[functor_id] = max_applications;
+
+        for (const auto& [input_id, amount] : F.inputs)
+        {
+          pool[input_id] -= amount * max_applications;
+          if (pool[input_id] <= tol)
+            pool.erase(input_id);
+        }
+
+        pool[F.output.first] += F.output.second * max_applications;
+      }
+    }
+
+    map = reduced_map;
+  }
+
   // Runs a single iteration of SWO w/ or w/o updating stats
   // Increment operations will not be limited by stat t/f
   bool run_iteration(bool check_stats)
@@ -1118,6 +1346,7 @@ private:
       prod::Solution new_solution;
       // Run one of two strategies depending on current phase 
       new_solution = (wasp.current_phase == HUNTING) ? hunt(wasp) : parasite(wasp);
+      prune_map(new_solution.map);
 
       if (new_solution.fitness > wasp.current_solution.fitness)
       {
@@ -1220,7 +1449,7 @@ public:
       std::cout << " (produced: " << solution.final_resource_pool.find(graph.get_target())->second << " units)\n\n";
     }
     else 
-      std::cout << "(produced: 0 units)\n\n";
+      std::cout << " (produced: 0 units)\n\n";
 
     std::unordered_set<int> resources_used;
     for (const auto& [functor_id, _] : solution.map)
