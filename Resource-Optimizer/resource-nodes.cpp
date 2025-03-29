@@ -6,13 +6,16 @@
  *
  * Graph follows a directed acyclic graph 
  */
-
+#define nohypr_
+#ifndef nohypr_
 #include "hypergraph.hpp"
+#endif
 #include "swo.hpp"
 
 // Testing 
 int main(void)
 {
+#ifndef nohypr_
   // Define our source and functors  
   hypr::Hypergraph graph = hypr::Hypergraph("SI-Simple Graph");
   // Produces 120 of X 
@@ -58,35 +61,101 @@ int main(void)
 
   std::vector<hypr::PathStep> optimized_optimal = optimized_rotor.search_optimal();
   print_graph(optimized_rotor, optimized_optimal, "Optimal Solution");
+#endif
+  // OptimizedHypergraph takes significant time for even simple supply chains 
+  // swo.hpp uses a different (better) class setup than hypergraph.hpp (Among numerous other improvements)
   
-  // OptimizedHypergraph fails to even compute the simple path of the computer problem. 
-  // Lets define our SWO system now.
-  
-  // swo.hpp uses a different (better) class setup than hypergraph.hpp
-  prod::Graph intermediate_graph;
+  // Easy Supply Chain Problems 
+  // Rotors
+  prod::Graph rotor_graph;
 
   // Create source node and functors 
-  intermediate_graph.set_target("Rotor");
-  intermediate_graph.add_resource("Iron Ore", true, 480.0);
-  intermediate_graph.add_functor("Iron Smelter", {{"Iron Ore", 30.0}}, {"Iron Ingot", 30.0});
-  intermediate_graph.add_functor("Rod Constructor", {{"Iron Ingot", 15.0}}, {"Iron Rod", 15.0});
-  intermediate_graph.add_functor("Plate Constructor", {{"Iron Ingot", 30.0}}, {"Iron Plate", 20.0});
-  intermediate_graph.add_functor("Screw Constructor", {{"Iron Rod", 10.0}}, {"Screw", 40.0});
-  intermediate_graph.add_functor("Rotor Assembler", {{"Iron Rod", 20.0}, {"Screw", 100.0}}, {"Rotor", 4.0});
+  rotor_graph.set_target("Rotor");
+  rotor_graph.add_resource("Iron Ore", true, 480.0);
+  rotor_graph.add_functor("Iron Smelter", {{"Iron Ore", 30.0}}, {"Iron Ingot", 30.0});
+  rotor_graph.add_functor("Rod Constructor", {{"Iron Ingot", 15.0}}, {"Iron Rod", 15.0});
+  rotor_graph.add_functor("Screw Constructor", {{"Iron Rod", 10.0}}, {"Screw", 40.0});
+  rotor_graph.add_functor("Rotor Assembler", {{"Iron Rod", 20.0}, {"Screw", 100.0}}, {"Rotor", 4.0});
 
   // Just using default hyperparameters for the moment
-  SWO::SpiderWaspOptimizer rotors(intermediate_graph, 30);
+  SWO::SpiderWaspOptimizer rotors(rotor_graph, 20, {0.25, 0.1}, {0.8, 0.4, 0.4, 0.3}, {0.35, 0.7, 0.6, 0.1}, 500, 250);
+  prod::Solution rotor_solution = rotors.optimize(true);
 
-  std::cout << "Seg fault isn't in constructor\n";
+  // rotors.print_stats();
+  rotors.print(rotor_solution); 
 
-  prod::Solution solution = rotors.optimize(true);
+  // Modular Frame Graph 
+  prod::Graph modular_frame_graph;
+  modular_frame_graph.set_target("Modular Frame");
+  modular_frame_graph.add_resource("Iron Ore", true, 480.0);
 
-  std::cout << "Seg fault isn't in optimize\n";
+  // Basic processing 
+  modular_frame_graph.add_functor("Iron Smelter", {{"Iron Ore", 30.0}}, {"Iron Ingot", 30.0});
+  modular_frame_graph.add_functor("Rod Constructor", {{"Iron Ingot", 15.0}}, {"Iron Rod", 15.0});
+  modular_frame_graph.add_functor("Plate Constructor", {{"Iron Ingot", 30.0}}, {"Iron Plate", 20.0});
+  modular_frame_graph.add_functor("Screw Constructor", {{"Iron Rod", 10.0}}, {"Screw", 40.0});
 
-  rotors.print(solution); 
-  std::cout << "End of source file\n";
+  // Intermediate processing 
+  modular_frame_graph.add_functor("Reinforced Plate Assembler", 
+                                  {{"Iron Plate", 30.0}, {"Screw", 60.0}},
+                                  {"Reinforced Iron Plate", 5.0});
 
-/*
+  // Final assembly
+  modular_frame_graph.add_functor("Modular Frame Assembler",
+                                  {{"Reinforced Iron Plate", 3.0}, {"Iron Rod", 12.0}},
+                                  {"Modular Frame", 2.0});
+
+  SWO::SpiderWaspOptimizer modular_frames(modular_frame_graph, 30, {0.25, 0.1}, {0.8, 0.4, 0.4, 0.3}, {0.35, 0.7, 0.6, 0.1}, 1500, 500);
+  prod::Solution frame_solution = modular_frames.optimize(true);
+
+  // modular_frames.print_stats();
+  modular_frames.print(frame_solution);
+
+  // Advanced Supply Chain Problems
+  // Heavy Modular Frames 
+  prod::Graph hmf_graph;
+  hmf_graph.set_target("Heavy Modular Frame");
+
+  hmf_graph.add_resource("Iron Ore", true, 240.0);
+  hmf_graph.add_resource("Coal", true, 90.0);
+  hmf_graph.add_resource("Limestone", true, 90.0);
+  
+  // Basic processing 
+  hmf_graph.add_functor("Iron Smelter", {{"Iron Ore", 30.0}}, {"Iron Ingot", 30.0});
+  hmf_graph.add_functor("Rod Constructor", {{"Iron Ingot", 15.0}}, {"Iron Rod", 15.0});
+  hmf_graph.add_functor("Plate Constructor", {{"Iron Ingot", 30.0}}, {"Iron Plate", 20.0});
+  hmf_graph.add_functor("Screw Constructor", {{"Iron Rod", 10.0}}, {"Screw", 40.0});
+  hmf_graph.add_functor("Steel Smelter", {{"Iron Ore", 45.0}, {"Coal", 45.0}}, {"Steel Ingot", 45.0});
+  hmf_graph.add_functor("Steel Pipe Constructor", {{"Steel Ingot", 30.0}}, {"Steel Pipe", 20.0});
+  hmf_graph.add_functor("Steel Beam Constructor", {{"Steel Ingot", 60.0}}, {"Steel Beam", 15.0});
+  hmf_graph.add_functor("Concrete Constructor", {{"Limestone", 45.0}}, {"Concrete", 15.0});
+
+  // Intermediate processing
+  hmf_graph.add_functor("Reinforced Plate Assembler", 
+                        {{"Iron Plate", 30.0}, {"Screw", 60.0}}, 
+                        {"Reinforced Iron Plate", 5.0});
+
+  hmf_graph.add_functor("Modular Frame Assembler",
+                        {{"Reinforced Iron Plate", 3.0}, {"Iron Rod", 12.0}},
+                        {"Modular Frame", 2.0});
+
+  hmf_graph.add_functor("Encased Beam Assembler", 
+                        {{"Steel Beam", 4.0}, {"Concrete", 5.0}},
+                        {"Encased Industrial Beam", 1.0});
+
+  // Final Manufacturer 
+  hmf_graph.add_functor("Heavy Modular Frame Manufacturer", 
+                        {{"Modular Frame", 5.0}, {"Steel Pipe", 15.0},
+                         {"Encased Industrial Beam", 5.0}, {"Screw", 100.0}},
+                        {"Heavy Modular Frame", 1.0});
+
+  SWO::SpiderWaspOptimizer heavy_modular_frames(hmf_graph, 50, {0.3, 0.2}, {0.8, 0.6, 0.3, 0.4}, {0.3, 0.75, 0.65, 0.15}, 4500, 1500);
+  prod::Solution hmf_solution = heavy_modular_frames.optimize(true);
+
+  heavy_modular_frames.print_stats();
+  heavy_modular_frames.print(hmf_solution);
+
+  /*
   OptimizedHypergraph computer_factory = OptimizedHypergraph("Computer Factory");
   
   // Add source nodes (raw resources)
