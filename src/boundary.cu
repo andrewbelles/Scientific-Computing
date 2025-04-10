@@ -8,9 +8,9 @@ __host__ static inline bool equal(std::vector<float> new_container, std::vector<
 } 
 
 /*
-   Updates the bounds given a new container vector. This stalls the program until
-   it can accurately update the spatial hashmap for a new size. 
-   */
+  Updates the bounds given a new container vector. This stalls the program until
+  it can accurately update the spatial hashmap for a new size. 
+*/
 __host__ void updateBounds(Lookup *d_lookup_, particleContainer *d_objs_, std::vector<float> new_container, uint32_t particle_recount, const float h) {
   // refac cuda mem manage now pass cpu resize 
   static std::vector<float> boundary; 

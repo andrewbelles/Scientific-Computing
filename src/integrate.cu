@@ -1,12 +1,9 @@
 #include "integrate.hpp"
-#include <cuda_runtime.h>
-#include <cuda_runtime_api.h>
-#include <vector_functions.h>
 
 // Defines 
 #define k 3000
 #define rho0 1000
-#define viscosity 5e-2
+#define viscosity 1e-1
 
 // #define __debug
 // #define __verbose

@@ -14,7 +14,7 @@
 #include <cstdint>
 
 #define tol 1e-6
-#define scale_factor 0.1
+#define scale_factor 1.0
 
 /**
  * Single entry into key/id paired table
