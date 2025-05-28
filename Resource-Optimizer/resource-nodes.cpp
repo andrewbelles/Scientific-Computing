@@ -14,13 +14,30 @@ int main(void)
   // OptimizedHypergraph takes significant time for even simple supply chains 
   // swo.hpp uses a different (better) class setup than hypergraph.hpp (Among numerous other improvements)
   
+  prod::Graph reinforced_graph;
+  reinforced_graph.set_target("Reinforced Iron Plate");
+  reinforced_graph.add_resource("Iron Ore", true, 120.0);
+  reinforced_graph.add_functor("Iron Smelter", {{"Iron Ore", 30.0}}, {"Iron Ingot", 30.0});
+  reinforced_graph.add_functor("Plate Constructor", {{"Iron Ingot", 30.0}}, {"Iron Plate", 20.0});
+  reinforced_graph.add_functor("Rod Constructor", {{"Iron Ingot", 15.0}}, {"Iron Rod", 15.0});
+  reinforced_graph.add_functor("Screw Constructor", {{"Iron Rod", 10.0}}, {"Screw", 40.0});
+
+  reinforced_graph.add_functor("Reinforced Plate Assembler", 
+                                  {{"Iron Plate", 30.0}, {"Screw", 60.0}},
+                                  {"Reinforced Iron Plate", 5.0});
+
+  SWO::SpiderWaspOptimizer reinforced(reinforced_graph, 30, {0.3, 0.1}, {0.8, 0.4, 0.4, 0.3}, {0.4, 0.7, 0.6, 0.1}, 500, 250);
+  prod::Solution reinforced_solution = reinforced.optimize(true);
+
+  reinforced.print(reinforced_solution);
+
   // Easy Supply Chain Problems 
   // Rotors
   prod::Graph rotor_graph;
 
   // Create source node and functors 
   rotor_graph.set_target("Rotor");
-  rotor_graph.add_resource("Iron Ore", true, 480.0);
+  rotor_graph.add_resource("Iron Ore", true, 120.0);
   rotor_graph.add_functor("Iron Smelter", {{"Iron Ore", 30.0}}, {"Iron Ingot", 30.0});
   rotor_graph.add_functor("Rod Constructor", {{"Iron Ingot", 15.0}}, {"Iron Rod", 15.0});
   rotor_graph.add_functor("Screw Constructor", {{"Iron Rod", 10.0}}, {"Screw", 40.0});
