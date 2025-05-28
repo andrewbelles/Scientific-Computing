@@ -1,0 +1,5 @@
+*/target/
+.venv/
+*/.venv/
+*/output_files/
+*/images/
