@@ -9,13 +9,13 @@
 #include <GL/glew.h>
 #include <cuda_gl_interop.h>
 
-
 // C++ headers
 #include <iostream> 
 #include <sstream>
 #include <fstream>
 
 // External libraries 
+#include <stdexcept>
 #include <thrust/device_ptr.h>
 #include <thrust/sort.h>
 
@@ -25,7 +25,7 @@
 // Standard blocksize for kernel call 
 constexpr size_t BLOCKSIZE = 256;  
 constexpr float L_host = 1.0; 
-constexpr float rho0_host = 1.0;
+constexpr float rho0_host = 1000.0;
 constexpr float2 zero_vec_host{0.0, 0.0};
 constexpr size_t MN_host = 200;
 
@@ -34,9 +34,9 @@ constexpr size_t MN_host = 200;
 __constant__ size_t MN = 200;
 
 __constant__ float L    = 1.0;
-__constant__ float rho0 = 1.0; // kg/m^3 
+__constant__ float rho0 = 1000.0; // kg/m^3 
 __constant__ float c0   = 20.0;
-__constant__ float visc = 1.0;    // TODO: What value? 
+__constant__ float visc = 0.01;    // TODO: What value? 
 
 __constant__ float2 zero_vector{0.0, 0.0};
 
@@ -60,23 +60,23 @@ struct ParticleMatrix
 
 
 // Macro for all Cuda API Calls to return error and function name etc. of offender 
-#define CUDA_CHECK(call)                                                \
-    do {                                                                \
-        cudaError_t err__ = (call);                                     \
-        if (err__ != cudaSuccess) {                                     \
-            std::ostringstream ss;                                      \
-            ss << __FILE__ << ':' << __LINE__ << "  "                   \
-               << cudaGetErrorName(err__) << " – "                      \
-               << cudaGetErrorString(err__);                            \
-            throw std::runtime_error(ss.str());                         \
-        }                                                               \
+#define CUDA_CHECK(call)                              \
+    do {                                              \
+        cudaError_t err__ = (call);                   \
+        if (err__ != cudaSuccess) {                   \
+            std::ostringstream ss;                    \
+            ss << __FILE__ << ':' << __LINE__ << "  " \
+               << cudaGetErrorName(err__) << " – "    \
+               << cudaGetErrorString(err__);          \
+            throw std::runtime_error(ss.str());       \
+        }                                             \
     } while (0)
 
 
 // Spatial lookup structure 
 struct Spatial 
 {
-  struct value 
+  struct Value 
   {
     uint2 cell_id; 
     uint64_t key;
@@ -85,16 +85,8 @@ struct Spatial
 
   // col number of entries 
   uint2 cells;
-  value *entries;
+  Value *entries;
   size_t *start, *end;
-
-  // Set all values to size_t max in table for start and end arrays  
-  void table_clear(size_t cell_count) {
-    // each array is numCells long
-    cudaMemsetAsync(start, 0xFF, cell_count * sizeof(size_t), 0);
-    cudaMemsetAsync(end,   0xFF, cell_count * sizeof(size_t), 0);
-  }
-
 };
 
 
@@ -112,6 +104,11 @@ __device__ uint2 position_to_cell_id(float2 position, float smoothing_radius)
   uint2 cell_id;
   cell_id.x = std::floor(position.x / smoothing_radius);
   cell_id.y = std::floor(position.y / smoothing_radius);
+  
+  float position_y_rel = position.y / smoothing_radius; 
+
+  if (position_y_rel < 0.0)
+    printf("Negative Cell ID: (%f, %f) (%u,%u)\n", position.x, position.y, cell_id.x, cell_id.y);
 
   return cell_id; 
 }
@@ -126,7 +123,7 @@ __host__ __device__ uint64_t pack_key(uint2 cell_id)
 
 
 // Kernel to compute all particles cell_id 
-__global__ void set_keys(ParticleMatrix* particles, Spatial::value* entries, size_t* start, size_t* end)
+__global__ void set_keys(ParticleMatrix* particles, Spatial::Value* entries, size_t* start, size_t* end)
 {
   const size_t idx = threadIdx.x + blockDim.x * blockIdx.x; 
   if (idx >= particles->cols)
@@ -144,14 +141,13 @@ __global__ void set_keys(ParticleMatrix* particles, Spatial::value* entries, siz
 
 
 // Get the start and end arrays from key values generated 
-__global__ void define_cell_ranges(Spatial::value* entries, size_t* start, size_t* end, size_t N, size_t xcell)
+__global__ void define_cell_ranges(Spatial::Value* entries, size_t* start, size_t* end, size_t N, size_t xcell)
 {
   size_t idx = threadIdx.x + blockDim.x * blockIdx.x; 
   if (idx >= N)
     return; 
 
-  const uint2 cell_id = entries[idx].cell_id; 
-  const uint64_t key  = cell_id.y * xcell + cell_id.x; 
+  const uint64_t key = entries[idx].cell_id.y * xcell + entries[idx].cell_id.x;
 
   // Set idx of start and end cell if non-matching to cell previous to it
   if (idx == 0 || key != entries[idx - 1].key)
@@ -166,9 +162,8 @@ __global__ void define_cell_ranges(Spatial::value* entries, size_t* start, size_
 __host__ void generate_spatial_table(ParticleMatrix* particles, Spatial table, const Metadata meta)
 {
   const size_t N = meta.N; 
-  // if table is non-empty clear all values async 
-  table.table_clear(meta.cells.x * meta.cells.y);
-
+  cudaMemset(table.start, 0, meta.cells.x * sizeof(size_t));
+  cudaMemset(table.end,   0, C * sizeof(size_t));
   // Kernel call to set cell_id 
   const size_t GRIDSIZE = (N + BLOCKSIZE - 1) / BLOCKSIZE; 
   set_keys<<<GRIDSIZE, BLOCKSIZE>>>(particles, table.entries, table.start, table.end); 
@@ -176,10 +171,10 @@ __host__ void generate_spatial_table(ParticleMatrix* particles, Spatial table, c
   CUDA_CHECK(cudaDeviceSynchronize());
 
   // Sort entries
-  thrust::device_ptr<Spatial::value> table_entries(table.entries);
+  thrust::device_ptr<Spatial::Value> table_entries(table.entries);
   // Lambda comparator for entries with priority to x coordinate then y, then pidx 
   thrust::sort(table_entries, table_entries + N, 
-    [] __device__ (const Spatial::value& a, const Spatial::value& b)
+    [] __device__ (const Spatial::Value& a, const Spatial::Value& b)
     {
       return a.key < b.key;
     }
@@ -189,6 +184,23 @@ __host__ void generate_spatial_table(ParticleMatrix* particles, Spatial table, c
   define_cell_ranges<<<GRIDSIZE, BLOCKSIZE>>>(table.entries, table.start, table.end, N, meta.cells.x); 
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
+
+  size_t C = meta.cells.x * meta.cells.y;
+  std::vector<size_t> h_start(C);
+  std::vector<size_t> h_end  (C);
+  std::vector<Spatial::Value> h_entries(N);
+  cudaMemcpy(h_start .data(), table.start,  C*sizeof(size_t), cudaMemcpyDeviceToHost);
+  cudaMemcpy(h_end   .data(), table.end,    C*sizeof(size_t), cudaMemcpyDeviceToHost);
+  cudaMemcpy(h_entries.data(), table.entries, N*sizeof(Spatial::Value), cudaMemcpyDeviceToHost);
+
+  size_t total = 0;
+  for(size_t cell=0; cell<C; ++cell) {
+    size_t s = h_start[cell], e = h_end[cell];
+    printf("cell %2zu: [%2zu, %2zu)\n", cell, s, e);
+    total += (e > s ? e - s : 0);
+  }
+  printf("Total entries = %zu  (should be %zu)\n", total, N);
+
 }
 
 
@@ -196,7 +208,7 @@ __host__ void generate_spatial_table(ParticleMatrix* particles, Spatial table, c
 __global__ void neighbor_search(
     ParticleMatrix* particles, 
     const Metadata meta, 
-    Spatial::value *entries, 
+    Spatial::Value *entries, 
     size_t* start,
     size_t* end, 
     int* neighbor_counts,
@@ -260,7 +272,7 @@ __global__ void neighbor_search(
             int jdx = entries[p].pidx; 
             // Skip self
             if (jdx == idx)
-              continue;   
+              continue;
 
             // relative position 
             float2 xj = particles->x[jdx];
@@ -326,34 +338,72 @@ __device__ float poly6(float sqr, float sqh)
 }
 
 
-// Gradiant of poly6 smoothing kernel 
-__device__ float2 poly6grad(float2 r, float sqh)
-{
-  // Compute squared distance 
-  float sqr = r.x * r.x + r.y * r.y;
-  float sqd = sqh - sqr;  
+// Gradient of spiky kernel
+__device__ float2 spiky_gradient(float2 r, float h) {
+    float rlen = sqrtf(r.x*r.x + r.y*r.y);
+    if (rlen == 0.0 || rlen > h) 
+      return zero_vector;
 
-  if (sqd <= 0.0)
-    return make_float2(0.0, 0.0);
-
-  float C = poly6_constant / powf(sqh, 4);
-  float coeff = -6.0 * C * sqd * sqd; 
-  // Return distance vector scaled 
-  return make_float2(r.x * coeff, r.y * coeff);
+    const float C = 30.0 / (M_PI * powf(h,5));
+    float t = (h - rlen);
+    float coeff = -C * t*t / rlen;  
+    return make_float2(r.x * coeff,
+                       r.y * coeff);
 }
 
 
-// Laplacian of poly6 smoothing kernel
-__device__ float poly6laplacian(float sqr, float sqh)
+// Laplacian of cubic spline smoothing kernel
+__device__ float cubic_spline_laplacian(float2 r, float h)
 {
-  float sqd = sqh - sqr; 
-  if (sqd <= 0.0)
-    return 0.0;
+    float rlen = sqrtf(r.x*r.x + r.y*r.y);
+    if (rlen > h) 
+      return 0.0;
 
-  float C = poly6_constant / powf(sqh, 4);
-  return -12.0 * C * sqd * (sqh - 3.0 * sqr);
+    // 2D constant: 40/(π h^5)
+    const float C = 40.0/(M_PI * powf(h,5));
+    return C * (h - rlen);
 }
 
+}
+
+
+// a tiny kernel, called once per frame:
+__global__ void enforce_boundaries(ParticleMatrix* particles) {
+  size_t idx = blockIdx.x*blockDim.x + threadIdx.x;
+  if (idx >= particles->cols) return;
+
+  float2 x = particles->x[idx];
+  float2 v = particles->v[idx];
+  float  h = particles->h;
+  float  L = ::L;           // your device constant
+  const float restitution = 0.9;
+
+  // left/right
+  if (x.x <  h) 
+  { 
+    x.x =  h;
+    v.x =  std::fabs(v.x) * restitution; 
+  }
+  else if (x.x > L-h)
+  { 
+    x.x = L-h;
+    v.x = -std::fabs(v.x) * restitution; 
+  }
+  
+  // bottom/top
+  if (x.y <  h) 
+  {
+    x.y =  h;
+    v.y =  std::fabs(v.y) * restitution; 
+  }
+  else if (x.y > L-h)
+  { 
+    x.y = L-h;
+    v.y = -std::fabs(v.y) * restitution; 
+  }
+
+  particles->x[idx] = x;
+  particles->v[idx] = v;
 }
 
 
@@ -364,10 +414,14 @@ __global__ void compute_densities(ParticleMatrix* particles, const int* neighbor
   if (idx >= particles->cols)
     return;
 
-  float sum = 0.0; 
+  if (neighbor_counts[idx] == 0)
+    printf("Particle %lu has an empty neighbor count\n", idx);
+
+  float sum = 1e-4; 
   float sqh = particles->h * particles->h;
   // Iterate over num of neighbors 
-  for (int num = 0; num < neighbor_counts[idx]; num++)
+  int cap = std::min(neighbor_counts[idx], static_cast<int>(MN));
+  for (int num = 0; num < cap; num++)
   {
     // Idx of relative particle from list  
     int jdx   = neighbor_list[idx * MN + num];
@@ -395,32 +449,17 @@ __global__ void compute_forces(ParticleMatrix* particles, const int* neighbor_co
   if (idx >= particles->cols)
     return; 
 
-  // Pre-compute ? 
-  const float kb = rho0 * c0 * c0; 
-  const float kd = 2 * sqrt(kb * particles->mass);
-
   // Get local values for particle 
   const float2 x      = particles->x[idx];
   const float xrho    = particles->density[idx]; 
   const float xpres   = (rho0 * c0 * c0) * (xrho - rho0);
   const float2 v      = particles->v[idx];
 
-  particles->fsys[idx].y += particles->mass * -9.81; 
-
-  // Check for x boundary 
-  if (x.x < particles->h)
-    particles->fsys[idx].x += kb * (particles->h - x.x) - (kd * v.x);
-  else if (x.x > L - particles->h)
-    particles->fsys[idx].x += -kb * (particles->h -x.x) - (kd * v.x);
+  //particles->fsys[idx].y += particles->mass * -9.81; 
   
-  // Likewise check y boundary 
-  if (x.y < particles->h)
-    particles->fsys[idx].y += kb * (particles->h - x.y) - (kd * v.y);
-  else if (x.y > L - particles->h)
-    particles->fsys[idx].y += -kb * (particles->h -x.y) - (kd * v.y);
-
-  for (int num = 0; num < neighbor_counts[idx]; num++)
-{
+  int cap = std::min(neighbor_counts[idx], static_cast<int>(MN));
+  for (int num = 0; num < cap; num++)
+  {
     // Get relative values for neighbor 
     size_t jdx  = neighbor_list[idx * MN + num];
     float2 xrel = particles->x[jdx];
@@ -432,12 +471,12 @@ __global__ void compute_forces(ParticleMatrix* particles, const int* neighbor_co
 
     // Compute the pressure force 
     float a = -particles->mass * ((xpres / (xrho * xrho)) + (jpres / (jrho * jrho)));
-    float2 gW = kern::poly6grad(dj, particles->h * particles->h);
+    float2 gW = kern::spiky_gradient(dj, particles->h);
     float2 av = make_float2(gW.x * a, gW.y * a);
     particles->fpres[idx] = add_float2(particles->fpres[idx], av);
 
     // Compute the viscosity force 
-    float laplacian = kern::poly6laplacian(dj.x * dj.x + dj.y * dj.y, particles->h * particles->h);
+    float laplacian = kern::cubic_spline_laplacian(dj, particles->h);
     float b = visc * particles->mass / jrho * laplacian;
     float2 relv = subtract_float2(particles->v[jdx], v);
     particles->fvisc[idx] = add_float2(particles->fvisc[idx], make_float2(relv.x * b, relv.y * b));
@@ -446,7 +485,7 @@ __global__ void compute_forces(ParticleMatrix* particles, const int* neighbor_co
 
 
 // Computes first half of integration with half a timestep 
-__global__ void first_integrate(ParticleMatrix* particles, float half_dt)
+__global__ void verlet_kick(ParticleMatrix* particles, float half_dt)
 {
   const size_t idx = threadIdx.x + blockDim.x * blockIdx.x; 
   if (idx >= particles->cols)
@@ -459,6 +498,8 @@ __global__ void first_integrate(ParticleMatrix* particles, float half_dt)
   );
 
   // Compute acceleration from force and integrate for a half step
+  //if (particles->density[idx] == 0.0)
+    //printf("Division By Zero\n");
   float2 a = make_float2(ftotal.x / particles->density[idx], ftotal.y / particles->density[idx]);
   particles->v[idx].x += a.x * half_dt;
   particles->v[idx].y += a.y * half_dt; 
@@ -466,7 +507,7 @@ __global__ void first_integrate(ParticleMatrix* particles, float half_dt)
 
 
 // Computes second half after forces have been calculated 
-__global__ void second_integrate(ParticleMatrix* particles, float half_dt)
+__global__ void verlet_drift(ParticleMatrix* particles, float half_dt)
 {
   const size_t idx = threadIdx.x + blockDim.x * blockIdx.x; 
   if (idx >= particles->cols)
@@ -483,11 +524,11 @@ __global__ void reset_accumulators(ParticleMatrix* particles)
   if (idx >= particles->cols)
     return;
 
-  if (particles->x[idx].x > L || particles->x[idx].x < 0 || particles->x[idx].y > L || particles->x[idx].y < 0)
-    printf("Particle out of bounds (%f,%f): %lu\n", particles->x[idx].x, particles->x[idx].y, idx);
+  //if (particles->x[idx].x > L || particles->x[idx].x < 0 || particles->x[idx].y > L || particles->x[idx].y < 0)
+  //  printf("Particle out of bounds (%f,%f): %lu\n", particles->x[idx].x, particles->x[idx].y, idx);
 
   // Zero out accumulated values 
-  particles->density[idx] = 0.0;
+  particles->density[idx] = 1e-4;
   particles->fsys[idx] = particles->fpres[idx] = particles->fvisc[idx] = zero_vector; 
 }
 
@@ -497,7 +538,7 @@ __global__ void reset_accumulators(ParticleMatrix* particles)
 __host__ void handle_forces(ParticleMatrix* particles, const Metadata meta, int* neighbor_counts, int* neighbor_list)
 {
   // TODO: Compute dynamic timestep 
-  const float dt = 1e-4 / 2.0; // dt(particles) -> float  
+  const float dt = GetFrameTime();
   const size_t GRIDSIZE = (meta.N + BLOCKSIZE - 1) / BLOCKSIZE;
 
   // KERNEL CALLS - All use the same launch parameters  
@@ -513,11 +554,15 @@ __host__ void handle_forces(ParticleMatrix* particles, const Metadata meta, int*
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
 
-  first_integrate<<<GRIDSIZE, BLOCKSIZE>>>(particles, dt); 
+  verlet_kick<<<GRIDSIZE, BLOCKSIZE>>>(particles, dt/2.0); 
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
   
-  second_integrate<<<GRIDSIZE, BLOCKSIZE>>>(particles, dt);
+  verlet_drift<<<GRIDSIZE, BLOCKSIZE>>>(particles, dt);
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  enforce_boundaries<<<GRIDSIZE, BLOCKSIZE>>>(particles);
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -529,7 +574,7 @@ __host__ void handle_forces(ParticleMatrix* particles, const Metadata meta, int*
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
 
-  first_integrate<<<GRIDSIZE, BLOCKSIZE>>>(particles, dt); 
+  verlet_kick<<<GRIDSIZE, BLOCKSIZE>>>(particles, dt/2.0); 
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
 }
@@ -606,9 +651,7 @@ void unregister_buffers(Buffer* buffers)
 
 }
 
-
 namespace shdr {
-
 
 // Read all data from shader file into return value 
 // Credit ChatGPT o4-mini-high
@@ -692,7 +735,7 @@ int main(void)
   glewInit();
   glEnable(GL_PROGRAM_POINT_SIZE);
 
-  GLuint program = shdr::create_program("shaders/fragment.frag", "shaders/vertex.vert");
+  GLuint program = shdr::create_program("../shaders/fragment.frag", "../shaders/vertex.vert");
   GLint projection_location = glGetUniformLocation(program, "uProj");
 
   GLuint point_vao;
@@ -702,8 +745,8 @@ int main(void)
   // System constants
   const size_t N = 100; 
   const size_t M = std::ceil(std::sqrt(N));
-  const float particle_spacing = L_host / M; 
-  const float h = 2.0 * particle_spacing; 
+  const float particle_spacing = L_host / static_cast<float>(M);
+  const float h = 2.0f * particle_spacing;
 
   // Set metadata
   Metadata meta = (Metadata)
@@ -728,24 +771,33 @@ int main(void)
   h_p.h    = h;
   
   // Particle position initialization
-  // Uniform distribution over range [h, L - h]
-  float exact_dx = (L_host - 2 * h) / N; 
-  int cols = static_cast<int>(std::floor(L_host - 2 * h / exact_dx));
-  int rows = static_cast<int>(std::ceil(static_cast<float>(N) / cols)); 
+  float delta = (L_host - 2*h) / float(M);
 
   std::vector<float2> host_positions(N);
-  std::vector<float2> host_velocities(N);
+  std::vector<float2> host_velocities(N, zero_vec_host);
 
-  // Initialize position in square lattice 
-  int pid = 0; 
-  for (int i = 0; i < rows && pid < N; i++)
+  float min_pos = h + 1e-4;
+  float max_pos = (L_host - h) - 1e-4;
+  
+  int pid = 0;
+  for (int i = 0; i < int(M) && pid < int(N); ++i) 
   {
-    for (int j = 0; j < cols && pid < N; j++)
+    for (int j = 0; j < int(M) && pid < int(N); ++j) 
     {
-      float x = h + (i + 0.5) * exact_dx; 
-      float y = h + (j + 0.5) * exact_dx; 
+      // x,y ∈ (h, L-h), never equal to the walls:
+      float x = h + (i + 0.5f) * delta;
+      float y = h + (j + 0.5f) * delta;
       host_positions[pid] = make_float2(x, y);
-      host_velocities[pid] = zero_vec_host;
+
+      if (host_positions[pid].x < min_pos) 
+        host_positions[pid].x = min_pos;
+      else if (host_positions[pid].x > max_pos) 
+        host_positions[pid].x = max_pos;
+      if (host_positions[pid].y < min_pos) 
+        host_positions[pid].y = min_pos;
+      else if (host_positions[pid].y > max_pos) 
+        host_positions[pid].y = max_pos;
+
       pid++;
     }
   }
@@ -760,7 +812,7 @@ int main(void)
   // Table is already a host pointer so no memcpy required to a device pointer
   Spatial table;
   table.cells = meta.cells; 
-  cudaMalloc(&table.entries, N * sizeof(Spatial::value));
+  cudaMalloc(&table.entries, N * sizeof(Spatial::Value));
   cudaMalloc(&table.start, meta.cells.x * meta.cells.y * sizeof(size_t));
   cudaMalloc(&table.end, meta.cells.x * meta.cells.y * sizeof(size_t));
 
@@ -771,10 +823,10 @@ int main(void)
 
   // setting up matrix 
   float projection_matrix[16] = {
-    2.0/L_host,      0,    0,    0,
-        0, -2.0/L_host,    0,    0,
-        0,      0,   -1,    0,
-     -1.0,    1.0,    0,    1
+      2.0/L_host, 0,        0,  0,
+      0,          2.0/L_host, 0,  0,
+      0,          0,       -1,  0,
+     -1.0,       -1.0,     0,   1
   };
 
   // Set up buffers 
@@ -796,6 +848,7 @@ int main(void)
     // Handle drawing from buffer 
 
     BeginDrawing();
+
       ClearBackground(BLACK);
 
       DrawRectangleLines(100, 100, 600, 600, WHITE);
@@ -803,6 +856,7 @@ int main(void)
 
       glBindVertexArray(point_vao);
       glUseProgram(program);
+      assert(projection_location >= 0);
       glUniformMatrix4fv(projection_location, 1, GL_FALSE, projection_matrix);
 
       glEnableVertexAttribArray(0);
