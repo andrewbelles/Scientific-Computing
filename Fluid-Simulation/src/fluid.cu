@@ -10,6 +10,7 @@
 #include <cuda_gl_interop.h>
 
 // C++ headers
+#include <driver_types.h>
 #include <iostream> 
 #include <sstream>
 #include <fstream>
@@ -17,27 +18,27 @@
 // External libraries 
 #include <stdexcept>
 #include <thrust/device_ptr.h>
+#include <thrust/iterator/counting_iterator.h>
 #include <thrust/sort.h>
 
 // Graphics libraries 
 #include <raylib.h>
 
-// Standard blocksize for kernel call 
-constexpr size_t BLOCKSIZE = 256;  
-constexpr float L_host = 1.0; 
-constexpr float rho0_host = 1000.0;
+// CPU Constants
+constexpr size_t BLOCKSIZE      = 256;  
+constexpr float L_host          = 3.0; 
+constexpr float rho0_host       = 1.0;
 constexpr float2 zero_vec_host{0.0, 0.0};
-constexpr size_t MN_host = 200;
+constexpr size_t MN_host        = 125;
+constexpr float c0_host         = 3.1; 
+constexpr float visc_host       = 0.01;
 
-
-// Max neighbor count
-__constant__ size_t MN = 200;
-
-__constant__ float L    = 1.0;
-__constant__ float rho0 = 1000.0; // kg/m^3 
-__constant__ float c0   = 20.0;
-__constant__ float visc = 0.01;    // TODO: What value? 
-
+// Matching GPU Constants 
+__constant__ size_t MN          = 125;
+__constant__ float L            = 3.0;
+__constant__ float rho0         = 1.0; 
+__constant__ float c0           = 3.1;
+__constant__ float visc         = 0.01;
 __constant__ float2 zero_vector{0.0, 0.0};
 
 __device__ __host__ float2 add_float2(float2 a, float2 b)
@@ -54,7 +55,7 @@ struct ParticleMatrix
 {
   std::size_t cols; 
   float mass, h, *density;
-  float2 *x, *v; 
+  float2 *x, *v, *a; 
   float2 *fpres, *fvisc, *fsys;
 };
 
@@ -95,6 +96,7 @@ struct Metadata
 {
   uint2 cells;
   size_t N; 
+  float h;
 };
 
 
@@ -115,15 +117,14 @@ __device__ uint2 position_to_cell_id(float2 position, float smoothing_radius)
 
 
 // Return a packed key from a key value pair. 
-__host__ __device__ uint64_t pack_key(uint2 cell_id)
+__host__ __device__ uint64_t pack_key(uint2 cell_id, size_t xcells) 
 {
-  // Morton style packing
-  return (uint64_t(cell_id.x) << 32) | uint64_t(cell_id.y);
+  return static_cast<uint64_t>(cell_id.x) * xcells + static_cast<uint64_t>(cell_id.y);
 }
 
 
 // Kernel to compute all particles cell_id 
-__global__ void set_keys(ParticleMatrix* particles, Spatial::Value* entries, size_t* start, size_t* end)
+__global__ void set_keys(ParticleMatrix* particles, const Metadata meta, Spatial::Value* entries, size_t* start, size_t* end)
 {
   const size_t idx = threadIdx.x + blockDim.x * blockIdx.x; 
   if (idx >= particles->cols)
@@ -135,7 +136,7 @@ __global__ void set_keys(ParticleMatrix* particles, Spatial::Value* entries, siz
 
   // Assign values to table 
   entries[idx].cell_id = cell_id;  // TODO: Needed? 
-  entries[idx].key     = pack_key(cell_id);
+  entries[idx].key     = pack_key(cell_id, meta.cells.x);
   entries[idx].pidx    = idx; 
 }
 
@@ -147,7 +148,7 @@ __global__ void define_cell_ranges(Spatial::Value* entries, size_t* start, size_
   if (idx >= N)
     return; 
 
-  const uint64_t key = entries[idx].cell_id.y * xcell + entries[idx].cell_id.x;
+  const uint64_t key = entries[idx].key;
 
   // Set idx of start and end cell if non-matching to cell previous to it
   if (idx == 0 || key != entries[idx - 1].key)
@@ -162,11 +163,12 @@ __global__ void define_cell_ranges(Spatial::Value* entries, size_t* start, size_
 __host__ void generate_spatial_table(ParticleMatrix* particles, Spatial table, const Metadata meta)
 {
   const size_t N = meta.N; 
-  cudaMemset(table.start, 0, meta.cells.x * sizeof(size_t));
+  size_t C = meta.cells.x * meta.cells.y;
+  cudaMemset(table.start, 0, C * sizeof(size_t));
   cudaMemset(table.end,   0, C * sizeof(size_t));
   // Kernel call to set cell_id 
   const size_t GRIDSIZE = (N + BLOCKSIZE - 1) / BLOCKSIZE; 
-  set_keys<<<GRIDSIZE, BLOCKSIZE>>>(particles, table.entries, table.start, table.end); 
+  set_keys<<<GRIDSIZE, BLOCKSIZE>>>(particles, meta, table.entries, table.start, table.end); 
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -184,23 +186,6 @@ __host__ void generate_spatial_table(ParticleMatrix* particles, Spatial table, c
   define_cell_ranges<<<GRIDSIZE, BLOCKSIZE>>>(table.entries, table.start, table.end, N, meta.cells.x); 
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
-
-  size_t C = meta.cells.x * meta.cells.y;
-  std::vector<size_t> h_start(C);
-  std::vector<size_t> h_end  (C);
-  std::vector<Spatial::Value> h_entries(N);
-  cudaMemcpy(h_start .data(), table.start,  C*sizeof(size_t), cudaMemcpyDeviceToHost);
-  cudaMemcpy(h_end   .data(), table.end,    C*sizeof(size_t), cudaMemcpyDeviceToHost);
-  cudaMemcpy(h_entries.data(), table.entries, N*sizeof(Spatial::Value), cudaMemcpyDeviceToHost);
-
-  size_t total = 0;
-  for(size_t cell=0; cell<C; ++cell) {
-    size_t s = h_start[cell], e = h_end[cell];
-    printf("cell %2zu: [%2zu, %2zu)\n", cell, s, e);
-    total += (e > s ? e - s : 0);
-  }
-  printf("Total entries = %zu  (should be %zu)\n", total, N);
-
 }
 
 
@@ -214,15 +199,15 @@ __global__ void neighbor_search(
     int* neighbor_counts,
     int* neighbor_list)
 {
-  const size_t bidx = blockIdx.x; 
-  const size_t cx   = bidx % meta.cells.x;
-  const size_t cy   = bidx / meta.cells.x;
+  const size_t cx   = blockIdx.x;
+  const size_t cy   = blockIdx.y;
+  const size_t cidx = cy * gridDim.x + cx; 
 
   // Size as defined by grid size 
   extern __shared__ size_t shared_pidx[];
   // Start and end indices 
-  const size_t start_index  = start[bidx];     // TODO: Are we certain this is in bounds of start/end 
-  const size_t end_index    = end[bidx];
+  const size_t start_index  = start[cidx];     // TODO: Are we certain this is in bounds of start/end 
+  const size_t end_index    = end[cidx];
 
   // Local count of particles 
   const size_t tidx   = threadIdx.x; 
@@ -271,8 +256,8 @@ __global__ void neighbor_search(
           {
             int jdx = entries[p].pidx; 
             // Skip self
-            if (jdx == idx)
-              continue;
+            //if (jdx == idx)
+            //  continue;
 
             // relative position 
             float2 xj = particles->x[jdx];
@@ -301,11 +286,13 @@ __host__ void neighbor_host(ParticleMatrix* particles, Spatial table, const Meta
   const size_t N = meta.N; 
   cudaMemsetAsync(neighbor_counts, 0, N * sizeof(int), 0);    // Set to 0 agnostic to whether it's already been done
   
+  // Call w/ 2D grid 
+  dim3 GRID(meta.cells.x, meta.cells.y);
+
   // Ensure shared memory spreads well for each block 
   constexpr size_t RED_BLOCKSIZE = BLOCKSIZE / 2;
-  const size_t GRIDSIZE = meta.cells.x * meta.cells.y; 
   const size_t shared_memory = RED_BLOCKSIZE * sizeof(size_t);
-  neighbor_search<<<GRIDSIZE, RED_BLOCKSIZE, shared_memory>>>(
+  neighbor_search<<<GRID, RED_BLOCKSIZE, shared_memory>>>(
     particles, 
     meta, 
     table.entries,
@@ -374,31 +361,30 @@ __global__ void enforce_boundaries(ParticleMatrix* particles) {
 
   float2 x = particles->x[idx];
   float2 v = particles->v[idx];
-  float  h = particles->h;
   float  L = ::L;           // your device constant
   const float restitution = 0.9;
 
   // left/right
-  if (x.x <  h) 
+  if (x.x < 1e-3) 
   { 
-    x.x =  h;
+    x.x =  1e-3;
     v.x =  std::fabs(v.x) * restitution; 
   }
-  else if (x.x > L-h)
+  else if (x.x > L-(1e-3))
   { 
-    x.x = L-h;
+    x.x = L-1e-3;
     v.x = -std::fabs(v.x) * restitution; 
   }
   
   // bottom/top
-  if (x.y <  h) 
+  if (x.y < 1e-3) 
   {
-    x.y =  h;
+    x.y =  1e-3;
     v.y =  std::fabs(v.y) * restitution; 
   }
-  else if (x.y > L-h)
+  else if (x.y > L-(1e-3))
   { 
-    x.y = L-h;
+    x.y = L-(1e-3);
     v.y = -std::fabs(v.y) * restitution; 
   }
 
@@ -455,7 +441,7 @@ __global__ void compute_forces(ParticleMatrix* particles, const int* neighbor_co
   const float xpres   = (rho0 * c0 * c0) * (xrho - rho0);
   const float2 v      = particles->v[idx];
 
-  //particles->fsys[idx].y += particles->mass * -9.81; 
+  particles->fsys[idx].y += particles->mass * -981; 
   
   int cap = std::min(neighbor_counts[idx], static_cast<int>(MN));
   for (int num = 0; num < cap; num++)
@@ -481,6 +467,10 @@ __global__ void compute_forces(ParticleMatrix* particles, const int* neighbor_co
     float2 relv = subtract_float2(particles->v[jdx], v);
     particles->fvisc[idx] = add_float2(particles->fvisc[idx], make_float2(relv.x * b, relv.y * b));
   }
+
+  // Compute acceleration directly
+  float2 ftotal = add_float2(particles->fpres[idx], add_float2(particles->fvisc[idx], particles->fsys[idx]));
+  particles->a[idx] = make_float2(ftotal.x / xrho, ftotal.y / xrho);
 }
 
 
@@ -491,18 +481,8 @@ __global__ void verlet_kick(ParticleMatrix* particles, float half_dt)
   if (idx >= particles->cols)
     return;
 
-  // sum total forces
-  float2 ftotal = add_float2(
-    particles->fsys[idx], 
-    add_float2(particles->fpres[idx], particles->fvisc[idx])
-  );
-
-  // Compute acceleration from force and integrate for a half step
-  //if (particles->density[idx] == 0.0)
-    //printf("Division By Zero\n");
-  float2 a = make_float2(ftotal.x / particles->density[idx], ftotal.y / particles->density[idx]);
-  particles->v[idx].x += a.x * half_dt;
-  particles->v[idx].y += a.y * half_dt; 
+  particles->v[idx].x += particles->a[idx].x * half_dt;
+  particles->v[idx].y += particles->a[idx].y * half_dt; 
 }
 
 
@@ -533,12 +513,53 @@ __global__ void reset_accumulators(ParticleMatrix* particles)
 }
 
 
+__host__ float adaptive_dt(ParticleMatrix* particles, const Metadata& meta)
+{
+  const float CFL    = 0.2; 
+  const float CFORCE = 0.25;
+  const float CVISC  = 0.125;
+
+  // Reduce the max magnitude from across all particles efficiently 
+  float max_velocity = thrust::transform_reduce(
+    thrust::device,
+    thrust::make_counting_iterator(0),
+    thrust::make_counting_iterator(static_cast<int>(meta.N)), 
+    [=] __device__ (int i) -> float
+    {
+      float2 v = particles->v[i];
+      return std::sqrt(v.x * v.x + v.y * v.y);
+    },
+    0.0, 
+    thrust::maximum<float>()
+  );
+
+  float max_accel = thrust::transform_reduce(
+    thrust::device,
+    thrust::make_counting_iterator(0),
+    thrust::make_counting_iterator(static_cast<int>(meta.N)), 
+    [=] __device__ (int i) -> float
+    {
+      float2 a = particles->a[i];
+      return std::sqrt(a.x * a.x + a.y * a.y);
+    },
+    0.0, 
+    thrust::maximum<float>()
+  );
+
+  float dt_acoustic = CFL * (meta.h / (c0_host + max_velocity));
+  float dt_force    = CFORCE * std::sqrt(meta.h / (max_accel + 1e-3));
+  float dt_visc     = CVISC * (meta.h * meta.h / (visc_host + 1e-3));
+  
+  // return smallest time constant
+  return std::min(dt_acoustic, std::min(dt_force, dt_visc)); 
+}
+
 // Compute the forces given the filled neighbor counts and list
 // Don't need table. 
-__host__ void handle_forces(ParticleMatrix* particles, const Metadata meta, int* neighbor_counts, int* neighbor_list)
+__host__ void handle_forces(ParticleMatrix* particles, const Metadata& meta, int* neighbor_counts, int* neighbor_list)
 {
   // TODO: Compute dynamic timestep 
-  const float dt = GetFrameTime();
+  const float dt = adaptive_dt(particles, meta);
   const size_t GRIDSIZE = (meta.N + BLOCKSIZE - 1) / BLOCKSIZE;
 
   // KERNEL CALLS - All use the same launch parameters  
@@ -743,16 +764,17 @@ int main(void)
   glBindVertexArray(point_vao);
 
   // System constants
-  const size_t N = 100; 
+  const size_t N = 5000; 
   const size_t M = std::ceil(std::sqrt(N));
   const float particle_spacing = L_host / static_cast<float>(M);
-  const float h = 2.0f * particle_spacing;
+  const float h = 2.0 * particle_spacing; 
 
   // Set metadata
   Metadata meta = (Metadata)
   {
     .cells = make_uint2(std::ceil(L_host / h), std::ceil(L_host / h)),
-    .N     = N
+    .N     = N,
+    .h     = h
   };
 
   // Allocate memory to particle device ptr
@@ -760,6 +782,7 @@ int main(void)
   cudaMalloc(&h_p.density, N * sizeof(float));
   cudaMalloc(&h_p.x, N * sizeof(float2)); 
   cudaMalloc(&h_p.v, N * sizeof(float2));
+  cudaMalloc(&h_p.a, N * sizeof(float2));
   cudaMalloc(&h_p.fpres, N * sizeof(float2)); 
   cudaMalloc(&h_p.fvisc, N * sizeof(float2));
   cudaMalloc(&h_p.fsys, N * sizeof(float2));
@@ -775,20 +798,21 @@ int main(void)
 
   std::vector<float2> host_positions(N);
   std::vector<float2> host_velocities(N, zero_vec_host);
+  std::vector<float2> host_accelerations(N, zero_vec_host);
 
   float min_pos = h + 1e-4;
   float max_pos = (L_host - h) - 1e-4;
-  
+
   int pid = 0;
-  for (int i = 0; i < int(M) && pid < int(N); ++i) 
+  for (int i = 0; i < static_cast<int>(M) && pid < static_cast<int>(N); ++i) 
   {
-    for (int j = 0; j < int(M) && pid < int(N); ++j) 
+    for (int j = 0; j < static_cast<int>(M) && pid < static_cast<int>(N); ++j) 
     {
-      // x,y ∈ (h, L-h), never equal to the walls:
-      float x = h + (i + 0.5f) * delta;
-      float y = h + (j + 0.5f) * delta;
+      float x = h + (i + 0.5) * delta;
+      float y = h + (j + 0.5) * delta;
       host_positions[pid] = make_float2(x, y);
 
+      // Clamp positions
       if (host_positions[pid].x < min_pos) 
         host_positions[pid].x = min_pos;
       else if (host_positions[pid].x > max_pos) 
@@ -805,6 +829,7 @@ int main(void)
   // Copy initialized vectors to device  
   cudaMemcpy(h_p.x, host_positions.data(), N * sizeof(float2), cudaMemcpyHostToDevice);
   cudaMemcpy(h_p.v, host_velocities.data(), N * sizeof(float2), cudaMemcpyHostToDevice);
+  cudaMemcpy(h_p.a, host_accelerations.data(), N * sizeof(float2), cudaMemcpyHostToDevice);
 
   // Copy all to device pointer 
   cudaMemcpy(particles, &h_p, sizeof(ParticleMatrix), cudaMemcpyHostToDevice);
@@ -851,19 +876,24 @@ int main(void)
 
       ClearBackground(BLACK);
 
+      // View port should match rectangle sizing 
       DrawRectangleLines(100, 100, 600, 600, WHITE);
       glViewport(100, 100, 600, 600);
 
+      // Get position buffer 
       glBindVertexArray(point_vao);
       glUseProgram(program);
-      assert(projection_location >= 0);
+      glUniform1f(glGetUniformLocation(program, "pointSize"), 5.0);
+      // Map projection matrix for particle positions 
       glUniformMatrix4fv(projection_location, 1, GL_FALSE, projection_matrix);
 
+      // Call buffers and draw points 
       glEnableVertexAttribArray(0);
       glBindBuffer(GL_ARRAY_BUFFER, buffer.pos_vbo);
       glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, (void*)0);
       glDrawArrays(GL_POINTS, 0, N);
 
+      // Disable buffers 
       glDisableVertexAttribArray(0);
       glBindBuffer(GL_ARRAY_BUFFER, 0);
       glBindVertexArray(0);
@@ -889,6 +919,8 @@ int main(void)
   cudaMemcpy(&h_p, particles, sizeof(ParticleMatrix), cudaMemcpyDeviceToHost);
 
   cudaFree(h_p.x);
+  cudaFree(h_p.v);
+  cudaFree(h_p.a);
   cudaFree(h_p.density);
   cudaFree(h_p.fsys);
   cudaFree(h_p.fpres);
