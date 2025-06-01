@@ -1,4 +1,3 @@
-
 // 2D simulation
 #include <GL/glew.h>
 
@@ -26,20 +25,26 @@
 
 // CPU Constants
 constexpr size_t BLOCKSIZE      = 256;  
-constexpr float L_host          = 3.0; 
+constexpr float L_host          = 5.0; 
 constexpr float rho0_host       = 1.0;
 constexpr float2 zero_vec_host{0.0, 0.0};
 constexpr size_t MN_host        = 125;
-constexpr float c0_host         = 3.1; 
-constexpr float visc_host       = 0.01;
+constexpr float c0_host         = 7.0; 
+constexpr float visc_host       = 1e-2;
 
 // Matching GPU Constants 
-__constant__ size_t MN          = 125;
-__constant__ float L            = 3.0;
+__constant__ size_t MN          = 100;
+__constant__ float L            = 5.0;
 __constant__ float rho0         = 1.0; 
-__constant__ float c0           = 3.1;
-__constant__ float visc         = 0.01;
+__constant__ float c0           = 7.0;
+__constant__ float visc         = 1e-2;
 __constant__ float2 zero_vector{0.0, 0.0};
+
+extern "C" {
+__constant__ float poly_C; 
+__constant__ float spiky_C;
+__constant__ float cubic_C; 
+}
 
 __device__ __host__ float2 add_float2(float2 a, float2 b)
 {
@@ -306,10 +311,6 @@ __host__ void neighbor_host(ParticleMatrix* particles, Spatial table, const Meta
 }
 
 // Smoothing Kernel functions 
-namespace kern 
-{
-
-__constant__ float poly6_constant = 4.0 / 3.1415926;
 
 // poly6 2d density kernel
 // Since r isn't explicitly required, opted to only use the squared value of r 
@@ -320,8 +321,7 @@ __device__ float poly6(float sqr, float sqh)
   if (sqd <= 0.0)
     return 0.0;
 
-  float C = poly6_constant / powf(sqh, 4);
-  return C * sqd * sqd * sqd;
+  return poly_C * sqd * sqd * sqd;
 }
 
 
@@ -331,9 +331,8 @@ __device__ float2 spiky_gradient(float2 r, float h) {
     if (rlen == 0.0 || rlen > h) 
       return zero_vector;
 
-    const float C = 30.0 / (M_PI * powf(h,5));
     float t = (h - rlen);
-    float coeff = -C * t*t / rlen;  
+    float coeff = -spiky_C * t*t / rlen;  
     return make_float2(r.x * coeff,
                        r.y * coeff);
 }
@@ -347,10 +346,7 @@ __device__ float cubic_spline_laplacian(float2 r, float h)
       return 0.0;
 
     // 2D constant: 40/(π h^5)
-    const float C = 40.0/(M_PI * powf(h,5));
-    return C * (h - rlen);
-}
-
+    return cubic_C * (h - rlen);
 }
 
 
@@ -420,11 +416,20 @@ __global__ void compute_densities(ParticleMatrix* particles, const int* neighbor
 
     // Compute density from kernel 
     float sqr = d.x * d.x + d.y * d.y; 
-    sum += particles->mass * kern::poly6(sqr, sqh);
+    sum += particles->mass * poly6(sqr, sqh);
   }
 
   // Set accumulated density 
   particles->density[idx] = sum;
+}
+
+
+// Simple function to return non-linear clamped pressure
+__device__ float compute_pressure(float rho_i)
+{
+  const float B = rho0 * c0 * c0 / 7.0;
+  float ratio = rho_i / rho0;
+  return (ratio > 1.0) ? B * (std::pow(ratio, 7) - 1.0) : 0.0;
 }
 
 
@@ -438,7 +443,9 @@ __global__ void compute_forces(ParticleMatrix* particles, const int* neighbor_co
   // Get local values for particle 
   const float2 x      = particles->x[idx];
   const float xrho    = particles->density[idx]; 
-  const float xpres   = (rho0 * c0 * c0) * (xrho - rho0);
+
+  float xpres = compute_pressure(xrho); 
+
   const float2 v      = particles->v[idx];
 
   particles->fsys[idx].y += particles->mass * -981; 
@@ -453,16 +460,16 @@ __global__ void compute_forces(ParticleMatrix* particles, const int* neighbor_co
 
     // Compute pressure from density for relative particle
     float jrho = particles->density[jdx];
-    float jpres = (rho0 * c0 * c0) * (jrho - rho0);
+    float jpres = compute_pressure(jrho);
 
     // Compute the pressure force 
     float a = -particles->mass * ((xpres / (xrho * xrho)) + (jpres / (jrho * jrho)));
-    float2 gW = kern::spiky_gradient(dj, particles->h);
+    float2 gW = spiky_gradient(dj, particles->h);
     float2 av = make_float2(gW.x * a, gW.y * a);
     particles->fpres[idx] = add_float2(particles->fpres[idx], av);
 
     // Compute the viscosity force 
-    float laplacian = kern::cubic_spline_laplacian(dj, particles->h);
+    float laplacian = cubic_spline_laplacian(dj, particles->h);
     float b = visc * particles->mass / jrho * laplacian;
     float2 relv = subtract_float2(particles->v[jdx], v);
     particles->fvisc[idx] = add_float2(particles->fvisc[idx], make_float2(relv.x * b, relv.y * b));
@@ -764,10 +771,18 @@ int main(void)
   glBindVertexArray(point_vao);
 
   // System constants
-  const size_t N = 5000; 
-  const size_t M = std::ceil(std::sqrt(N));
-  const float particle_spacing = L_host / static_cast<float>(M);
-  const float h = 2.0 * particle_spacing; 
+  constexpr size_t N = 10000; 
+
+  constexpr float area = L_host * L_host / 2.0;
+  constexpr float mass = rho0_host * area;
+  constexpr float mass_per = mass / static_cast<float>(N);
+
+  const size_t Mx = static_cast<size_t>(std::ceil(std::sqrt(2.0 * static_cast<float>(N))));
+  const float delta = L_host / static_cast<float>(Mx);
+  const size_t My = static_cast<size_t>(std::ceil((L_host / 2.0) / delta));
+
+  const float h = 1.3 * delta; 
+  const float r = h * 0.8 * (600 / L_host);
 
   // Set metadata
   Metadata meta = (Metadata)
@@ -788,40 +803,39 @@ int main(void)
   cudaMalloc(&h_p.fsys, N * sizeof(float2));
   cudaMalloc(&particles, sizeof(ParticleMatrix));
 
+
   // Set constant values 
   h_p.cols = N;
-  h_p.mass = rho0_host * particle_spacing * particle_spacing; 
+  h_p.mass = mass_per; 
   h_p.h    = h;
   
   // Particle position initialization
-  float delta = (L_host - 2*h) / float(M);
 
-  std::vector<float2> host_positions(N);
+  std::vector<float2> host_positions;
   std::vector<float2> host_velocities(N, zero_vec_host);
   std::vector<float2> host_accelerations(N, zero_vec_host);
 
-  float min_pos = h + 1e-4;
-  float max_pos = (L_host - h) - 1e-4;
+  host_positions.reserve(N);
 
   int pid = 0;
-  for (int i = 0; i < static_cast<int>(M) && pid < static_cast<int>(N); ++i) 
+  for (size_t i = 0; i < Mx && pid < N; ++i) 
   {
-    for (int j = 0; j < static_cast<int>(M) && pid < static_cast<int>(N); ++j) 
+    for (size_t j = 0; j < My && pid < N; ++j) 
     {
-      float x = h + (i + 0.5) * delta;
-      float y = h + (j + 0.5) * delta;
-      host_positions[pid] = make_float2(x, y);
+      float x = (i + 0.5) * delta;
+      float y = (L_host/2.0) + (j + 0.5) * delta;
 
       // Clamp positions
-      if (host_positions[pid].x < min_pos) 
-        host_positions[pid].x = min_pos;
-      else if (host_positions[pid].x > max_pos) 
-        host_positions[pid].x = max_pos;
-      if (host_positions[pid].y < min_pos) 
-        host_positions[pid].y = min_pos;
-      else if (host_positions[pid].y > max_pos) 
-        host_positions[pid].y = max_pos;
-
+      if (x < 0.0) 
+        x = 1e-4;
+      else if (x > L_host) 
+        x = L_host - 1e-4;
+      if (y < L_host / 2.0) 
+        y = (L_host / 2.0) + 1e-4;
+      else if (y > L_host) 
+        y = L_host- 1e-4;
+      
+      host_positions.emplace_back(make_float2(x, y));
       pid++;
     }
   }
@@ -854,6 +868,17 @@ int main(void)
      -1.0,       -1.0,     0,   1
   };
 
+  const float h8 = std::pow(h, 8);
+  const float h5 = std::pow(h, 5);
+
+  float POLY_CONST  = 4.0  / (M_PI * h8);
+  float SPIKY_CONST = 30.0 / (M_PI * h5);
+  float CUBIC_CONST = 40.0 / (M_PI * h5);
+
+  CUDA_CHECK(cudaMemcpyToSymbol(poly_C, &POLY_CONST, sizeof(float)));
+  CUDA_CHECK(cudaMemcpyToSymbol(spiky_C, &SPIKY_CONST, sizeof(float)));
+  CUDA_CHECK(cudaMemcpyToSymbol(cubic_C, &CUBIC_CONST, sizeof(float)));
+
   // Set up buffers 
   bufr::Buffer buffer;
   bufr::initialize_cuda_buffers(&buffer, N);
@@ -883,7 +908,7 @@ int main(void)
       // Get position buffer 
       glBindVertexArray(point_vao);
       glUseProgram(program);
-      glUniform1f(glGetUniformLocation(program, "pointSize"), 5.0);
+      glUniform1f(glGetUniformLocation(program, "pointSize"), r);
       // Map projection matrix for particle positions 
       glUniformMatrix4fv(projection_location, 1, GL_FALSE, projection_matrix);
 

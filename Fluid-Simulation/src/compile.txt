@@ -1,0 +1,1 @@
+nvcc -std=c++17 -arch=sm_89 --extended-lambda -expt-relaxed-constexpr -rdc=true fluid.cu -o fluid -lraylib -lGLEW -lGL -lX11 -lm -lcudart -L/usr/local/cuda-12.0/lib64
