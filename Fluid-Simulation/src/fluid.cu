@@ -13,6 +13,7 @@
 #include <iostream> 
 #include <sstream>
 #include <fstream>
+#include <random>
 
 // External libraries 
 #include <stdexcept>
@@ -30,20 +31,21 @@ constexpr float rho0_host       = 1.0;
 constexpr float2 zero_vec_host{0.0, 0.0};
 constexpr size_t MN_host        = 125;
 constexpr float c0_host         = 7.0; 
-constexpr float visc_host       = 1e-2;
+constexpr float visc_host       = 1e-1;
 
 // Matching GPU Constants 
 __constant__ size_t MN          = 100;
 __constant__ float L            = 5.0;
 __constant__ float rho0         = 1.0; 
 __constant__ float c0           = 7.0;
-__constant__ float visc         = 1e-2;
+__constant__ float visc         = 1e-1;
 __constant__ float2 zero_vector{0.0, 0.0};
 
 extern "C" {
 __constant__ float poly_C; 
 __constant__ float spiky_C;
 __constant__ float cubic_C; 
+__constant__ float pres_floor;
 }
 
 __device__ __host__ float2 add_float2(float2 a, float2 b)
@@ -357,31 +359,30 @@ __global__ void enforce_boundaries(ParticleMatrix* particles) {
 
   float2 x = particles->x[idx];
   float2 v = particles->v[idx];
-  float  L = ::L;           // your device constant
-  const float restitution = 0.9;
+  const float restitution = 0.98;
 
   // left/right
   if (x.x < 1e-3) 
   { 
     x.x =  1e-3;
-    v.x =  std::fabs(v.x) * restitution; 
+    v.x =  std::abs(v.x) * restitution; 
   }
-  else if (x.x > L-(1e-3))
+  else if (x.x > L - (1e-3))
   { 
-    x.x = L-1e-3;
-    v.x = -std::fabs(v.x) * restitution; 
+    x.x = L - 1e-3;
+    v.x = -std::abs(v.x) * restitution; 
   }
   
   // bottom/top
   if (x.y < 1e-3) 
   {
     x.y =  1e-3;
-    v.y =  std::fabs(v.y) * restitution; 
+    v.y =  std::abs(v.y) * restitution; 
   }
-  else if (x.y > L-(1e-3))
+  else if (x.y > L - (1e-3))
   { 
-    x.y = L-(1e-3);
-    v.y = -std::fabs(v.y) * restitution; 
+    x.y = L - (1e-3);
+    v.y = -std::abs(v.y) * restitution; 
   }
 
   particles->x[idx] = x;
@@ -428,8 +429,8 @@ __global__ void compute_densities(ParticleMatrix* particles, const int* neighbor
 __device__ float compute_pressure(float rho_i)
 {
   const float B = rho0 * c0 * c0 / 7.0;
-  float ratio = rho_i / rho0;
-  return (ratio > 1.0) ? B * (std::pow(ratio, 7) - 1.0) : 0.0;
+  float r = rho_i / rho0;
+  return (r > 1.0) ? B * ((r*r*r*r*r*r*r) - 1.0) : pres_floor;
 }
 
 
@@ -448,7 +449,7 @@ __global__ void compute_forces(ParticleMatrix* particles, const int* neighbor_co
 
   const float2 v      = particles->v[idx];
 
-  particles->fsys[idx].y += particles->mass * -981; 
+  particles->fsys[idx].y += particles->mass * -98100; 
   
   int cap = std::min(neighbor_counts[idx], static_cast<int>(MN));
   for (int num = 0; num < cap; num++)
@@ -771,15 +772,19 @@ int main(void)
   glBindVertexArray(point_vao);
 
   // System constants
-  constexpr size_t N = 10000; 
+  constexpr size_t N = 8000; 
+
+  constexpr float region_size = 2.5;
+  constexpr float offset      = (L_host - region_size) / 2.0;
 
   constexpr float area = L_host * L_host / 2.0;
   constexpr float mass = rho0_host * area;
   constexpr float mass_per = mass / static_cast<float>(N);
 
-  const size_t Mx = static_cast<size_t>(std::ceil(std::sqrt(2.0 * static_cast<float>(N))));
-  const float delta = L_host / static_cast<float>(Mx);
-  const size_t My = static_cast<size_t>(std::ceil((L_host / 2.0) / delta));
+  //const size_t Mx = static_cast<size_t>(std::ceil(std::sqrt(2.0 * static_cast<float>(N))));
+  const size_t M    = static_cast<size_t>(std::ceil(std::sqrt(static_cast<float>(N))));
+  const float delta = region_size / static_cast<float>(M);
+  //const size_t My = static_cast<size_t>(std::ceil((L_host / 2.0) / delta));
 
   const float h = 1.3 * delta; 
   const float r = h * 0.8 * (600 / L_host);
@@ -810,6 +815,9 @@ int main(void)
   h_p.h    = h;
   
   // Particle position initialization
+  
+  std::mt19937 rng(31);
+  std::uniform_real_distribution<float> drift(-0.1f*delta, 0.1f*delta);
 
   std::vector<float2> host_positions;
   std::vector<float2> host_velocities(N, zero_vec_host);
@@ -818,22 +826,23 @@ int main(void)
   host_positions.reserve(N);
 
   int pid = 0;
-  for (size_t i = 0; i < Mx && pid < N; ++i) 
+  for (size_t i = 0; i < M && pid < N; ++i) 
   {
-    for (size_t j = 0; j < My && pid < N; ++j) 
+    for (size_t j = 0; j < M && pid < N; ++j) 
     {
-      float x = (i + 0.5) * delta;
-      float y = (L_host/2.0) + (j + 0.5) * delta;
+      float x = offset + (i + 0.5) * delta + drift(rng);
+      float y = offset + (j + 0.5) * delta + drift(rng);
 
       // Clamp positions
-      if (x < 0.0) 
-        x = 1e-4;
-      else if (x > L_host) 
-        x = L_host - 1e-4;
-      if (y < L_host / 2.0) 
-        y = (L_host / 2.0) + 1e-4;
-      else if (y > L_host) 
-        y = L_host- 1e-4;
+      if (x < offset) 
+        x = offset + 1e-4;
+      else if (x > offset + region_size) 
+        x = offset + region_size - 1e-4;
+
+      if (y < offset) 
+        y = offset + 1e-4;
+      else if (y > offset + region_size) 
+        y = offset + region_size - 1e-4;
       
       host_positions.emplace_back(make_float2(x, y));
       pid++;
@@ -874,10 +883,12 @@ int main(void)
   float POLY_CONST  = 4.0  / (M_PI * h8);
   float SPIKY_CONST = 30.0 / (M_PI * h5);
   float CUBIC_CONST = 40.0 / (M_PI * h5);
+  constexpr float pres_floor_host = 0.01 * rho0_host * c0_host * c0_host;
 
   CUDA_CHECK(cudaMemcpyToSymbol(poly_C, &POLY_CONST, sizeof(float)));
   CUDA_CHECK(cudaMemcpyToSymbol(spiky_C, &SPIKY_CONST, sizeof(float)));
   CUDA_CHECK(cudaMemcpyToSymbol(cubic_C, &CUBIC_CONST, sizeof(float)));
+  CUDA_CHECK(cudaMemcpyToSymbol(pres_floor, &pres_floor_host, sizeof(float)));
 
   // Set up buffers 
   bufr::Buffer buffer;
