@@ -772,7 +772,7 @@ int main(void)
   glBindVertexArray(point_vao);
 
   // System constants
-  constexpr size_t N = 8000; 
+  constexpr size_t N = 5000; 
 
   constexpr float region_size = 2.5;
   constexpr float offset      = (L_host - region_size) / 2.0;
@@ -820,7 +820,7 @@ int main(void)
   std::uniform_real_distribution<float> drift(-0.1f*delta, 0.1f*delta);
 
   std::vector<float2> host_positions;
-  std::vector<float2> host_velocities(N, zero_vec_host);
+  std::vector<float2> host_velocities(N, {0.0, -2*9.81});
   std::vector<float2> host_accelerations(N, zero_vec_host);
 
   host_positions.reserve(N);

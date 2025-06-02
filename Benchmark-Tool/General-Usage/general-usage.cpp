@@ -26,7 +26,7 @@ static std::vector<float> random_vector_float(size_t size)
   return vec;
 }
 
-__attribute__((optnone))
+//__attribute__((optnone))
 static float naive_square_root(float& x)
 {
   float guess = x / 2.0;
@@ -50,14 +50,14 @@ static float emb_sqrt(float& x)
   return res;
 }
 
-__attribute__((optnone))
+// __attribute__((optnone))
 static float sqrt_wrapper(float& x)
 {
   return std::sqrt(x);
 }
 
 // Vector benchmark functions
-__attribute__((optnone))
+// __attribute__((optnone))
 static float sqrt_vec_wrapper(std::vector<float>& x)
 {
   float average = 0.0; 
@@ -68,7 +68,7 @@ static float sqrt_vec_wrapper(std::vector<float>& x)
   return average / static_cast<float>(x.size());
 }
 
-__attribute__((optnone))
+// __attribute__((optnone))
 static float naive_vec_sqrt(std::vector<float>& x)
 {
   float average = 0.0; 
