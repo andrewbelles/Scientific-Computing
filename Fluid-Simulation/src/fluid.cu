@@ -1,22 +1,12 @@
-// 2D simulation
-#include <GL/glew.h>
-
-// Cuda headers
-#include <GL/glext.h>
-#include <cuda_runtime.h>
-#include <cuda_runtime_api.h>
-#include <GL/glew.h>
-#include <cuda_gl_interop.h>
+#include "shader.hpp"
 
 // C++ headers
 #include <driver_types.h>
 #include <iostream> 
 #include <sstream>
-#include <fstream>
 #include <random>
 
 // External libraries 
-#include <stdexcept>
 #include <thrust/device_ptr.h>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/sort.h>
@@ -30,34 +20,33 @@ constexpr float L_host          = 5.0;
 constexpr float rho0_host       = 1.0;
 constexpr float2 zero_vec_host{0.0, 0.0};
 constexpr size_t MN_host        = 125;
-constexpr float c0_host         = 7.0; 
+constexpr float c0_host         = 14.0; 
 constexpr float visc_host       = 1e-1;
 
 // Matching GPU Constants 
 __constant__ size_t MN          = 100;
 __constant__ float L            = 5.0;
 __constant__ float rho0         = 1.0; 
-__constant__ float c0           = 7.0;
+__constant__ float c0           = 14.0;
 __constant__ float visc         = 1e-1;
 __constant__ float2 zero_vector{0.0, 0.0};
 
-extern "C" {
 __constant__ float poly_C; 
 __constant__ float spiky_C;
 __constant__ float cubic_C; 
 __constant__ float pres_floor;
-}
 
-__device__ __host__ float2 add_float2(float2 a, float2 b)
+// Inlined "overloads" for float2 struct 
+__device__ __host__ inline float2 add_float2(float2 a, float2 b)
 {
   return make_float2(a.x + b.x, a.y + b.y);
 }
-
-__device__ __host__ float2 subtract_float2(float2 a, float2 b)
+__device__ __host__ inline float2 subtract_float2(float2 a, float2 b)
 {
   return make_float2(a.x - b.x, a.y - b.y);
 }
 
+// Stores all particles data on device 
 struct ParticleMatrix 
 {
   std::size_t cols; 
@@ -65,7 +54,6 @@ struct ParticleMatrix
   float2 *x, *v, *a; 
   float2 *fpres, *fvisc, *fsys;
 };
-
 
 // Macro for all Cuda API Calls to return error and function name etc. of offender 
 #define CUDA_CHECK(call)                              \
@@ -111,27 +99,21 @@ struct Metadata
 __device__ uint2 position_to_cell_id(float2 position, float smoothing_radius)
 {
   uint2 cell_id;
-  cell_id.x = std::floor(position.x / smoothing_radius);
-  cell_id.y = std::floor(position.y / smoothing_radius);
-  
-  float position_y_rel = position.y / smoothing_radius; 
-
-  if (position_y_rel < 0.0)
-    printf("Negative Cell ID: (%f, %f) (%u,%u)\n", position.x, position.y, cell_id.x, cell_id.y);
-
+  cell_id.x = (uint32_t)(position.x / smoothing_radius);
+  cell_id.y = (uint32_t)(position.y / smoothing_radius);
   return cell_id; 
 }
 
 
 // Return a packed key from a key value pair. 
-__host__ __device__ uint64_t pack_key(uint2 cell_id, size_t xcells) 
+__host__ __device__ inline uint64_t pack_key(uint2 cell_id, size_t xcells) 
 {
   return static_cast<uint64_t>(cell_id.x) * xcells + static_cast<uint64_t>(cell_id.y);
 }
 
 
 // Kernel to compute all particles cell_id 
-__global__ void set_keys(ParticleMatrix* particles, const Metadata meta, Spatial::Value* entries, size_t* start, size_t* end)
+__global__ void set_keys(ParticleMatrix* __restrict__ particles, const Metadata meta, Spatial::Value* entries)
 {
   const size_t idx = threadIdx.x + blockDim.x * blockIdx.x; 
   if (idx >= particles->cols)
@@ -149,7 +131,7 @@ __global__ void set_keys(ParticleMatrix* particles, const Metadata meta, Spatial
 
 
 // Get the start and end arrays from key values generated 
-__global__ void define_cell_ranges(Spatial::Value* entries, size_t* start, size_t* end, size_t N, size_t xcell)
+__global__ void define_cell_ranges(Spatial::Value* __restrict__ entries, size_t* start, size_t* end, size_t N, size_t xcell)
 {
   size_t idx = threadIdx.x + blockDim.x * blockIdx.x; 
   if (idx >= N)
@@ -175,7 +157,7 @@ __host__ void generate_spatial_table(ParticleMatrix* particles, Spatial table, c
   cudaMemset(table.end,   0, C * sizeof(size_t));
   // Kernel call to set cell_id 
   const size_t GRIDSIZE = (N + BLOCKSIZE - 1) / BLOCKSIZE; 
-  set_keys<<<GRIDSIZE, BLOCKSIZE>>>(particles, meta, table.entries, table.start, table.end); 
+  set_keys<<<GRIDSIZE, BLOCKSIZE>>>(particles, meta, table.entries); 
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -198,22 +180,23 @@ __host__ void generate_spatial_table(ParticleMatrix* particles, Spatial table, c
 
 // Cell-block tiling algorithm to generate neighbor list
 __global__ void neighbor_search(
-    ParticleMatrix* particles, 
+    ParticleMatrix* __restrict__ particles, 
     const Metadata meta, 
-    Spatial::Value *entries, 
-    size_t* start,
-    size_t* end, 
+    Spatial::Value* __restrict__ entries, 
+    size_t* __restrict__ start,
+    size_t* __restrict__ end, 
     int* neighbor_counts,
     int* neighbor_list)
 {
+  // Shared memory for block ~ cell grid for neighbor index caching 
+  extern __shared__ size_t shared_pidx[];
+
   const size_t cx   = blockIdx.x;
   const size_t cy   = blockIdx.y;
   const size_t cidx = cy * gridDim.x + cx; 
 
-  // Size as defined by grid size 
-  extern __shared__ size_t shared_pidx[];
   // Start and end indices 
-  const size_t start_index  = start[cidx];     // TODO: Are we certain this is in bounds of start/end 
+  const size_t start_index  = start[cidx];       
   const size_t end_index    = end[cidx];
 
   // Local count of particles 
@@ -225,7 +208,8 @@ __global__ void neighbor_search(
 
   if (lcount == 0)
     return; 
-
+  
+  // Iterates over blocks 
   for (size_t base = 0; base < lcount; base += blockDim.x)
   {
     size_t lpid = base + tidx;
@@ -288,7 +272,7 @@ __global__ void neighbor_search(
 
 
 // Builds a neighbor list
-__host__ void neighbor_host(ParticleMatrix* particles, Spatial table, const Metadata meta, int* neighbor_counts, int* neighbor_list)
+__host__ void neighbor_host(ParticleMatrix* __restrict__ particles, Spatial table, const Metadata meta, int* neighbor_counts, int* neighbor_list)
 {
   const size_t N = meta.N; 
   cudaMemsetAsync(neighbor_counts, 0, N * sizeof(int), 0);    // Set to 0 agnostic to whether it's already been done
@@ -316,7 +300,7 @@ __host__ void neighbor_host(ParticleMatrix* particles, Spatial table, const Meta
 
 // poly6 2d density kernel
 // Since r isn't explicitly required, opted to only use the squared value of r 
-__device__ float poly6(float sqr, float sqh)
+__device__ inline float poly6(float sqr, float sqh)
 {
   float sqd = sqh - sqr;
   // Outside influence - shouldn't occur
@@ -328,7 +312,7 @@ __device__ float poly6(float sqr, float sqh)
 
 
 // Gradient of spiky kernel
-__device__ float2 spiky_gradient(float2 r, float h) {
+__device__ inline float2 spiky_gradient(float2 r, float h) {
     float rlen = sqrtf(r.x*r.x + r.y*r.y);
     if (rlen == 0.0 || rlen > h) 
       return zero_vector;
@@ -341,7 +325,7 @@ __device__ float2 spiky_gradient(float2 r, float h) {
 
 
 // Laplacian of cubic spline smoothing kernel
-__device__ float cubic_spline_laplacian(float2 r, float h)
+__device__ inline float cubic_spline_laplacian(float2 r, float h)
 {
     float rlen = sqrtf(r.x*r.x + r.y*r.y);
     if (rlen > h) 
@@ -391,16 +375,13 @@ __global__ void enforce_boundaries(ParticleMatrix* particles) {
 
 
 // Computes all accumulated density for each particle 
-__global__ void compute_densities(ParticleMatrix* particles, const int* neighbor_counts, const int* neighbor_list)
+__global__ void compute_densities(ParticleMatrix* particles, const int* __restrict__ neighbor_counts, const int* __restrict__ neighbor_list)
 {
   const size_t idx = threadIdx.x + blockDim.x * blockIdx.x; 
   if (idx >= particles->cols)
     return;
 
-  if (neighbor_counts[idx] == 0)
-    printf("Particle %lu has an empty neighbor count\n", idx);
-
-  float sum = 1e-4; 
+  float sum = 1e-4;   // Initialize to Tol 
   float sqh = particles->h * particles->h;
   // Iterate over num of neighbors 
   int cap = std::min(neighbor_counts[idx], static_cast<int>(MN));
@@ -435,7 +416,7 @@ __device__ float compute_pressure(float rho_i)
 
 
 // Density precomputed - Compute all forces  
-__global__ void compute_forces(ParticleMatrix* particles, const int* neighbor_counts, const int* neighbor_list)
+__global__ void compute_forces(ParticleMatrix* particles, const int* __restrict__ neighbor_counts, const int* __restrict__ neighbor_list)
 {
   const size_t idx = threadIdx.x + blockDim.x * blockIdx.x; 
   if (idx >= particles->cols)
@@ -512,16 +493,13 @@ __global__ void reset_accumulators(ParticleMatrix* particles)
   if (idx >= particles->cols)
     return;
 
-  //if (particles->x[idx].x > L || particles->x[idx].x < 0 || particles->x[idx].y > L || particles->x[idx].y < 0)
-  //  printf("Particle out of bounds (%f,%f): %lu\n", particles->x[idx].x, particles->x[idx].y, idx);
-
   // Zero out accumulated values 
   particles->density[idx] = 1e-4;
   particles->fsys[idx] = particles->fpres[idx] = particles->fvisc[idx] = zero_vector; 
 }
 
 
-__host__ float adaptive_dt(ParticleMatrix* particles, const Metadata& meta)
+__host__ float adaptive_dt(const ParticleMatrix* __restrict__ particles, const Metadata& meta)
 {
   const float CFL    = 0.2; 
   const float CFORCE = 0.25;
@@ -564,7 +542,7 @@ __host__ float adaptive_dt(ParticleMatrix* particles, const Metadata& meta)
 
 // Compute the forces given the filled neighbor counts and list
 // Don't need table. 
-__host__ void handle_forces(ParticleMatrix* particles, const Metadata& meta, int* neighbor_counts, int* neighbor_list)
+__host__ std::pair<float, float> handle_forces(ParticleMatrix* particles, const Metadata& meta, const int* __restrict__ neighbor_counts, const int* __restrict__ neighbor_list)
 {
   // TODO: Compute dynamic timestep 
   const float dt = adaptive_dt(particles, meta);
@@ -603,11 +581,36 @@ __host__ void handle_forces(ParticleMatrix* particles, const Metadata& meta, int
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
 
+  float max_density = thrust::transform_reduce(
+    thrust::device,
+    thrust::make_counting_iterator(0),
+    thrust::make_counting_iterator(static_cast<int>(meta.N)), 
+    [=] __device__ (int i) -> float
+    {
+      return particles->density[i];
+    },
+    -FLT_MAX, 
+    thrust::maximum<float>()
+  );
+
+  float min_density = thrust::transform_reduce(
+    thrust::device,
+    thrust::make_counting_iterator(0),
+    thrust::make_counting_iterator(static_cast<int>(meta.N)), 
+    [=] __device__ (int i) -> float
+    {
+      return particles->density[i];
+    },
+    FLT_MAX, 
+    thrust::minimum<float>()
+  );
+
   verlet_kick<<<GRIDSIZE, BLOCKSIZE>>>(particles, dt/2.0); 
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
-}
 
+  return std::make_pair(max_density, min_density);
+}
 
 namespace bufr {
 
@@ -619,7 +622,6 @@ struct Buffer
   cudaGraphicsResource* pos_res{nullptr};
   cudaGraphicsResource* rho_res{nullptr};
 };
-
 
 // Takes number of particles and sets up buffers
 void initialize_cuda_buffers(Buffer* buffers, size_t N)
@@ -639,7 +641,7 @@ void initialize_cuda_buffers(Buffer* buffers, size_t N)
   cudaGraphicsGLRegisterBuffer(&buffers->rho_res, buffers->rho_vbo, cudaGraphicsRegisterFlagsNone);
 }
 
-
+// Updates the buffers caching density and position every frame 
 void update_buffers(Buffer* buffers, ParticleMatrix host_particles)
 {
   size_t size; 
@@ -659,7 +661,7 @@ void update_buffers(Buffer* buffers, ParticleMatrix host_particles)
 
 
 // Free allocated resourcess 
-void unregister_buffers(Buffer* buffers)
+void deregister_buffers(Buffer* buffers)
 {
   // Check for nullptr and unregister 
   if (buffers->pos_res != nullptr)
@@ -680,82 +682,6 @@ void unregister_buffers(Buffer* buffers)
 
 }
 
-namespace shdr {
-
-// Read all data from shader file into return value 
-// Credit ChatGPT o4-mini-high
-std::string load_shader(const std::string& path)
-{
-  std::ifstream shader_file(path, std::ios::in | std::ios::binary);
-  if (!shader_file)
-    throw std::runtime_error("File doesn't exist");
-
-  std::string shader; 
-  shader_file.seekg(0, std::ios::end);
-  shader.resize(shader_file.tellg());
-  shader_file.seekg(0, std::ios::beg);
-  shader_file.read(&shader[0], shader.size());
-  shader_file.close();
-
-  return shader;
-}
-
-
-// Compile the shader
-GLuint compile_shader(GLenum type, const std::string& src)
-{
-  char error[512];
-  GLint status;
-  GLuint shader = glCreateShader(type);
-  const char* cstr = src.c_str();
-
-  glShaderSource(shader, 1, &cstr, nullptr);
-  glCompileShader(shader);
-  glGetShaderiv(shader, GL_COMPILE_STATUS, &status);
-  if (!status)
-  {
-    glGetShaderInfoLog(shader, 512, nullptr, error); 
-    throw std::runtime_error(error);
-  }
-
-  return shader;
-}
-
-
-// Creates the program from file paths to fragment and vertex shaders 
-GLuint create_program(const std::string& fragment_path, const std::string& vertex_path)
-{
-  // Get shaders from source and compile 
-  std::string vertex_src   = load_shader(vertex_path);
-  std::string fragment_src = load_shader(fragment_path);
-  GLuint vertex_shader   = compile_shader(GL_VERTEX_SHADER, vertex_src);
-  GLuint fragment_shader = compile_shader(GL_FRAGMENT_SHADER, fragment_src);
-  GLuint program = glCreateProgram();
-
-  GLint status;
-  char error[512];
-
-  // Attach shaders to program 
-  glAttachShader(program, vertex_shader);
-  glAttachShader(program, fragment_shader);
-  glLinkProgram(program);
-
-  glGetProgramiv(program, GL_LINK_STATUS, &status);
-  if (!status)
-  {
-    glGetProgramInfoLog(program, 512, nullptr, error);
-    glDeleteProgram(program);
-    throw std::runtime_error(error);
-  }
-
-  glDeleteShader(vertex_shader);
-  glDeleteShader(fragment_shader);
-
-  return program;
-}
-
-}
-
 // Main 
 int main(void)
 {
@@ -772,7 +698,7 @@ int main(void)
   glBindVertexArray(point_vao);
 
   // System constants
-  constexpr size_t N = 8000; 
+  constexpr size_t N = 10000; 
 
   constexpr float region_size = 2.5;
   constexpr float offset      = (L_host - region_size) / 2.0;
@@ -820,7 +746,7 @@ int main(void)
   std::uniform_real_distribution<float> drift(-0.1f*delta, 0.1f*delta);
 
   std::vector<float2> host_positions;
-  std::vector<float2> host_velocities(N, zero_vec_host);
+  std::vector<float2> host_velocities(N, {0.0, -2*9.81});
   std::vector<float2> host_accelerations(N, zero_vec_host);
 
   host_positions.reserve(N);
@@ -894,6 +820,8 @@ int main(void)
   bufr::Buffer buffer;
   bufr::initialize_cuda_buffers(&buffer, N);
 
+  std::ofstream out("densities.txt");
+
   // Simulation loop
   SetTargetFPS(144);
   while (!WindowShouldClose())
@@ -902,7 +830,9 @@ int main(void)
     // One timestep of simulation  
     generate_spatial_table(particles, table, meta);
     neighbor_host(particles, table, meta, neighbor_counts, neighbor_list);
-    handle_forces(particles, meta, neighbor_counts, neighbor_list);
+    // Get range rho is under and print to file to check 
+    auto rho_range = handle_forces(particles, meta, neighbor_counts, neighbor_list);
+    out << rho_range.first << ',' << rho_range.second << '\n';   
 
     bufr::update_buffers(&buffer, h_p);
 
@@ -919,18 +849,28 @@ int main(void)
       // Get position buffer 
       glBindVertexArray(point_vao);
       glUseProgram(program);
-      glUniform1f(glGetUniformLocation(program, "pointSize"), r);
+
       // Map projection matrix for particle positions 
       glUniformMatrix4fv(projection_location, 1, GL_FALSE, projection_matrix);
+
+      glUniform1f(glGetUniformLocation(program, "uRhoMin"), 1.5);
+      glUniform1f(glGetUniformLocation(program, "uRhoMax"), 5);
+
+      glUniform1f(glGetUniformLocation(program, "pointSize"), r);
 
       // Call buffers and draw points 
       glEnableVertexAttribArray(0);
       glBindBuffer(GL_ARRAY_BUFFER, buffer.pos_vbo);
-      glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, (void*)0);
+      glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
       glDrawArrays(GL_POINTS, 0, N);
+
+      glEnableVertexAttribArray(1);
+      glBindBuffer(GL_ARRAY_BUFFER, buffer.rho_vbo);
+      glVertexAttribPointer(1, 1, GL_FLOAT, GL_FALSE, 0, nullptr);
 
       // Disable buffers 
       glDisableVertexAttribArray(0);
+      glDisableVertexAttribArray(1);
       glBindBuffer(GL_ARRAY_BUFFER, 0);
       glBindVertexArray(0);
       glUseProgram(0);
@@ -943,7 +883,7 @@ int main(void)
 
   glDeleteProgram(program);
   CloseWindow();
-  bufr::unregister_buffers(&buffer);
+  bufr::deregister_buffers(&buffer);
 
   cudaFree(neighbor_counts);
   cudaFree(neighbor_list); 

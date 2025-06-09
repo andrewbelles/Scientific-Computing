@@ -585,17 +585,7 @@ public:
 
     using Result = typename rootSimple<Error, Return>::Result;
 
-    Result init = (Result)
-    {
-      .data = (Data)
-      {
-        .id      = id,
-        .runtime = 0.0,
-        .speedup = 1.0
-      },
-      .value = Return(),
-      .error = Error()
-    };
+    Result init{{id,0.0,1.0}, Return(), Error()};
 
     // Initialize to Result 
     simple_.results.push_back(init);
@@ -699,17 +689,7 @@ private:
     baseline_error = simple_.error_function(baseline_value, baseline_value); 
 
     using Result = typename rootSimple<Error, Return>::Result;
-    Result result = (Result)
-    {
-      .data = (Data)
-      {
-        .id      = "Baseline",
-        .runtime = average_runtime,
-        .speedup = 1.0
-      },
-      .value = baseline_value,
-      .error = baseline_error
-    };
+    Result result{{"Baseline", average_runtime, 1.0}, baseline_value, baseline_error};
     simple_.results.push_back(result);
   }
 };
@@ -765,16 +745,7 @@ public:
     functions.push_back(std::forward<Function>(func));
 
     using Result = typename rootComplexError<Error>::Result;
-    Result init = (Result)
-    {
-      .data = (Data)
-      {
-        .id      = id,
-        .runtime = 0.0,
-        .speedup = 1.0
-      },
-      .error = Error()
-    };
+    Result init{{id, 0.0, 1.0}, Error()};
 
     // Initialize to Result 
     complex_.results.push_back(init);
@@ -810,7 +781,7 @@ public:
 
         // Collect modified argument from each call
         if (i == amgr_.iter - 1)
-          local_arguments[j] = amgr_.refs<stype>(arguments);
+          local_arguments[j] = amgr_.refs<this->stype>(arguments);
 
         auto runtime = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
         average_runtime[k] += static_cast<double>(runtime.count());
@@ -867,7 +838,7 @@ private:
 
       // Get argument matching type of type requested to be encapsulated 
       if (i == amgr_.iter - 1)
-        base_argument = amgr_.refs<stype>(arguments);
+        base_argument = amgr_.refs<this->stype>(arguments);
       
       auto runtime = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
       average_runtime += static_cast<double>(runtime.count());
@@ -875,24 +846,14 @@ private:
     average_runtime /= amgr_.iter;  // Ave of accumulated
 
     // Copy twice 
-    auto a = std::any_cast<stype>(base_argument);
-    auto b = std::any_cast<stype>(base_argument);
+    auto a = std::any_cast<this->stype>(base_argument);
+    auto b = std::any_cast<this->stype>(base_argument);
 
     // Call error function on baseline modified argument against itself 
     Error base_error = complex_.error_function(&a, &b);
 
     using Result = typename rootComplexError<Error>::Result;
-    Result result = (Result)
-    {
-      .data = (Data)
-      {
-        .id      = "Baseline",
-        .runtime = average_runtime,
-        .speedup = 1.0
-      },
-      .error = base_error 
-    };
-
+    Result result{{"Baseline", average_runtime, 1.0}, base_error};
     complex_.results.push_back(result);
   }
 };
@@ -935,13 +896,7 @@ public:
 
     functions.push_back(std::forward<Function>(func));
 
-    Data init = (Data)
-    {
-      .id      = id,
-      .runtime = 0.0,
-      .speedup = 1.0
-    };
-
+    Data init{id, 0.0, 1.0};
     // Initialize to Result 
     rvoid_.results.push_back(init);
   }
@@ -1026,12 +981,7 @@ private:
     }
     average_runtime /= amgr_.iter;  // Ave of accumulated
     
-    Data result = (Data)
-    {
-      .id      = "Baseline",
-      .runtime = average_runtime,
-      .speedup = 1.0
-    };
+    Data result{"Baseline", average_runtime, 1.0};
     rvoid_.results.push_back(result);
   }
 };
