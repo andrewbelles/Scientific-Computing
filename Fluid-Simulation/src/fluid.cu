@@ -1,7 +1,6 @@
 #include "shader.hpp"
 
 // C++ headers
-#include <driver_types.h>
 #include <iostream> 
 #include <sstream>
 #include <random>
@@ -20,15 +19,15 @@ constexpr float L_host          = 5.0;
 constexpr float rho0_host       = 1.0;
 constexpr float2 zero_vec_host{0.0, 0.0};
 constexpr size_t MN_host        = 125;
-constexpr float c0_host         = 14.0; 
-constexpr float visc_host       = 1e-1;
+constexpr float c0_host         = 18.0; 
+constexpr float visc_host       = 1;
 
 // Matching GPU Constants 
 __constant__ size_t MN          = 100;
 __constant__ float L            = 5.0;
 __constant__ float rho0         = 1.0; 
-__constant__ float c0           = 14.0;
-__constant__ float visc         = 1e-1;
+__constant__ float c0           = 18.0;
+__constant__ float visc         = 1;
 __constant__ float2 zero_vector{0.0, 0.0};
 
 __constant__ float poly_C; 
@@ -343,7 +342,7 @@ __global__ void enforce_boundaries(ParticleMatrix* particles) {
 
   float2 x = particles->x[idx];
   float2 v = particles->v[idx];
-  const float restitution = 0.98;
+  const float restitution = 0.96;
 
   // left/right
   if (x.x < 1e-3) 
@@ -698,7 +697,7 @@ int main(void)
   glBindVertexArray(point_vao);
 
   // System constants
-  constexpr size_t N = 10000; 
+  constexpr size_t N = 50000; 
 
   constexpr float region_size = 2.5;
   constexpr float offset      = (L_host - region_size) / 2.0;
@@ -743,10 +742,10 @@ int main(void)
   // Particle position initialization
   
   std::mt19937 rng(31);
-  std::uniform_real_distribution<float> drift(-0.1f*delta, 0.1f*delta);
+  std::uniform_real_distribution<float> drift(-0.1*delta, 0.1*delta);
 
   std::vector<float2> host_positions;
-  std::vector<float2> host_velocities(N, {0.0, -2*9.81});
+  std::vector<float2> host_velocities(N, {0.0, -5*9.81});
   std::vector<float2> host_accelerations(N, zero_vec_host);
 
   host_positions.reserve(N);
@@ -809,7 +808,7 @@ int main(void)
   float POLY_CONST  = 4.0  / (M_PI * h8);
   float SPIKY_CONST = 30.0 / (M_PI * h5);
   float CUBIC_CONST = 40.0 / (M_PI * h5);
-  constexpr float pres_floor_host = 0.01 * rho0_host * c0_host * c0_host;
+  constexpr float pres_floor_host = 0.02 * rho0_host * c0_host * c0_host;
 
   CUDA_CHECK(cudaMemcpyToSymbol(poly_C, &POLY_CONST, sizeof(float)));
   CUDA_CHECK(cudaMemcpyToSymbol(spiky_C, &SPIKY_CONST, sizeof(float)));
@@ -853,8 +852,8 @@ int main(void)
       // Map projection matrix for particle positions 
       glUniformMatrix4fv(projection_location, 1, GL_FALSE, projection_matrix);
 
-      glUniform1f(glGetUniformLocation(program, "uRhoMin"), 1.5);
-      glUniform1f(glGetUniformLocation(program, "uRhoMax"), 5);
+      glUniform1f(glGetUniformLocation(program, "uRhoMin"), 1.25);
+      glUniform1f(glGetUniformLocation(program, "uRhoMax"), 2);
 
       glUniform1f(glGetUniformLocation(program, "pointSize"), r);
 

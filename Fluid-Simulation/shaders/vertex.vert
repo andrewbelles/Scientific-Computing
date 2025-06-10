@@ -16,6 +16,6 @@ void main()
 
     // 2) Normalize density to [0..1]
     float t = clamp((inRho - uRhoMin) / (uRhoMax - uRhoMin), 0.0, 1.0);
-    t = pow(t, 0.5);
+    t = pow(t, 0.25);
     vRhoNorm = t;
 }
