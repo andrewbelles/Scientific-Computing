@@ -1,1 +1,10 @@
 thrust/
+
+.cache/
+.bashrc 
+fluidsim 
+CMakeLists.txt
+compile_commands.json
+*.ncu-rep
+/ignore/ 
+bin/
