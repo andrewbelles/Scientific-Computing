@@ -1,10 +1,12 @@
 thrust/
 
 .cache/
+CMakeFiles/ 
+CMakeCache.txt
 .bashrc 
 fluidsim 
-CMakeLists.txt
 compile_commands.json
 *.ncu-rep
 /ignore/ 
 bin/
+build/ 
